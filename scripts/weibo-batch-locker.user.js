@@ -7,7 +7,7 @@
 // @match        https://weibo.com/*
 // @run-at       document-idle
 // @grant        none
-// @license      MIT
+// @license      Apache-2.0
 // ==/UserScript==
 
 /* global window, document, fetch, URLSearchParams, AbortController, confirm */

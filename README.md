@@ -72,4 +72,4 @@ scripts/weibo-batch-locker.user.js   # 脚本本体（自包含，无外部依�
 
 ## License
 
-MIT
+[Apache License 2.0](./LICENSE)
