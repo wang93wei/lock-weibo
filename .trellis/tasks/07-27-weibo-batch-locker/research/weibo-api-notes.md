@@ -4,8 +4,7 @@
 
 ## 核验账号
 
-- 登录账号：`特码头土豆派`（uid `1238726882`，即用户本人，8219 条微博）
-- 页面：`https://weibo.com/u/1238726882`
+- 在一个登录态的个人主页（`weibo.com/u/<uid>`）实测，账号身份已脱敏。
 - 前端 bundle：`https://h5.sinaimg.cn/m/weibo-pro-next/assets/index-BLM88guT.js`（weibo-pro-next 单页应用主 chunk，约 6.8MB）
 
 ## 1. 列表接口 mymblog（已实测）
@@ -17,13 +16,13 @@ Header: x-requested-with: XMLHttpRequest
 ```
 - 同源 fetch + `credentials:"include"` 自动带 cookie，无需额外鉴权头即可成功。
 
-**实测响应结构**（HTTP 200）
+**实测响应结构**（HTTP 200，数值已脱敏为示例）
 ```jsonc
 {
   "ok": 1,
   "data": {
-    "since_id": 5312956372879279,   // 分页游标，下一页带上
-    "total": 8219,
+    "since_id": 5312956372879279,   // 分页游标，下一页带上（示例值）
+    "total": 8219,                  // 该账号微博总数（示例值）
     "status_visible": ...,
     "list": [ /* 每页 20 条 */ ]
   }
