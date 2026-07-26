@@ -1034,9 +1034,9 @@
         </div>
 
         <div class="wbl-btns">
-          <button class="wbl-btn wbl-preview" id="wbl-preview">🔍 预览(dry-run)</button>
-          <button class="wbl-btn wbl-run" id="wbl-run">🔒 执行</button>
-          <button class="wbl-btn wbl-stop" id="wbl-stop" disabled>⏹ 停止</button>
+          <button class="wbl-btn wbl-preview" id="wbl-preview">预览(dry-run)</button>
+          <button class="wbl-btn wbl-run" id="wbl-run">执行</button>
+          <button class="wbl-btn wbl-stop" id="wbl-stop" disabled>停止</button>
           <button class="wbl-btn wbl-clear" id="wbl-clear">清空</button>
         </div>
 
