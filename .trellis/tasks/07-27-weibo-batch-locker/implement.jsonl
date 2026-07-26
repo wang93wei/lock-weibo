@@ -1,0 +1,3 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md", "reason": "微博 mymblog/modifyVisible 接口一手契约：URL、body、visible 枚举(type=1 仅自己可见)、visible 字段是对象、鉴权方式"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "纯函数筛选器/工具函数应优先复用而非重复实现"}

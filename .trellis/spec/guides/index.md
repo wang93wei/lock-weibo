@@ -23,6 +23,7 @@ These guides help you **ask the right questions before coding**.
 |-------|---------|-------------|
 | [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md) | Identify patterns and reduce duplication | When you notice repeated patterns |
 | [Cross-Layer Thinking Guide](./cross-layer-thinking-guide.md) | Think through data flow across layers | Features spanning multiple layers |
+| [Third-Party API Verification Guide](./third-party-api-verification-guide.md) | Verify undocumented/private API contracts before coding | Calling reverse-engineered or internal APIs |
 
 ---
 
@@ -50,6 +51,15 @@ These guides help you **ask the right questions before coding**.
 - [ ] Multiple branches update the same derived state from `kind` / `action`
 
 → Read [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md)
+
+### When to Think About Third-Party API Verification
+
+- [ ] You are calling an API with no official public docs (internal/reverse-engineered)
+- [ ] You "remember" the endpoint or params from a past project
+- [ ] You found the contract only in a third-party repo or blog
+- [ ] The target platform changes private APIs without notice (social/e-commerce)
+
+→ Read [Third-Party API Verification Guide](./third-party-api-verification-guide.md)
 
 ### When Verifying AI Cross-Review Results
 
