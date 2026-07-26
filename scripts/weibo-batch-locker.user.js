@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/weibo/weibo-batch-locker
-// @version      0.2.0
+// @version      0.3.0
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @match        https://weibo.com/*
@@ -38,7 +38,10 @@
   const CONFIG = {
     PAGE_SIZE: 20, // mymblog returns ~20 per page
     DEFAULT_DELAY_SEC: 1.5, // delay between each modifyVisible call
+    PAGE_DELAY_MS: 800, // delay between pagination requests (dry-run + run)
+    RATE_LIMITED_WAIT_MS: 30000, // pause length when weibo rate-limits us
     MAX_RETRY: 3, // retries per weibo on transient errors
+    MAX_PAGE_RETRY: 3, // retries on a rate-limited page before giving up
     RETRY_BASE_WAIT_MS: 2000, // exponential backoff base
     MAX_PAGES_FALLBACK: 5000, // safety cap to avoid infinite pagination
     PRIVATE_TYPE: 1, // visible.type value for "仅自己可见"
@@ -181,16 +184,26 @@
       credentials: "include",
       signal,
     });
+    // 403 => auth; 414/429 => weibo rate-limiting gateway (often with "频次过快")
     if (res.status === 403) {
       const e = new Error("Cookie 已过期或未登录 (HTTP 403)");
       e.code = "AUTH";
       throw e;
     }
+    if (res.status === 414 || res.status === 429) {
+      const e = new Error(`访问频次过快，被微博限流 (HTTP ${res.status})`);
+      e.code = "RISK";
+      throw e;
+    }
     if (!res.ok) throw new Error(`mymblog HTTP ${res.status}`);
     const data = await res.json();
     if (data.ok !== 1) {
-      const e = new Error(`mymblog ok=${data.ok} ${data.msg || ""}`.trim());
-      e.code = data.ok === 0 && /login|登录/i.test(data.msg || "") ? "AUTH" : "API";
+      const msg = data.msg || "";
+      const e = new Error(`mymblog ok=${data.ok} ${msg}`.trim());
+      // weibo sometimes returns ok:0 with a "频次/频繁/limit" message instead of an HTTP code
+      if (/频次|频繁|过快|limit|too many/i.test(msg)) e.code = "RISK";
+      else if (data.ok === 0 && /login|登录/i.test(msg)) e.code = "AUTH";
+      else e.code = "API";
       throw e;
     }
     if (!data.data || !Array.isArray(data.data.list)) {
@@ -214,11 +227,17 @@
       e.code = "AUTH";
       throw e;
     }
+    if (res.status === 414 || res.status === 429) {
+      const e = new Error(`访问频次过快，被微博限流 (HTTP ${res.status})`);
+      e.code = "RISK";
+      throw e;
+    }
     if (!res.ok) throw new Error(`modifyVisible HTTP ${res.status}`);
     const data = await res.json();
     if (!(data.ok > 0)) {
       const e = new Error(`modifyVisible ok=${data.ok} ${data.msg || ""}`.trim());
-      e.code = "RISK";
+      // ok<=0 with a rate/frequency message is rate-limiting; otherwise treat as risk too.
+      e.code = /频次|频繁|过快|limit|too many/i.test(data.msg || "") ? "RISK" : "RISK";
       throw e;
     }
     return data;
@@ -317,15 +336,30 @@
     while (page <= CONFIG.MAX_PAGES_FALLBACK) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-      let pageData;
-      try {
-        pageData = await fetchBlogPage({ uid, page, sinceId }, signal);
-      } catch (err) {
-        if (err.name === "AbortError") throw err;
-        if (err.code === "AUTH") throw err;
-        onLog(`第 ${page} 页拉取失败: ${err.message}，终止。`, "error");
-        break;
+      // Fetch this page, retrying on rate-limit with a long pause.
+      let pageData = null;
+      for (let attempt = 1; attempt <= CONFIG.MAX_PAGE_RETRY; attempt++) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        try {
+          pageData = await fetchBlogPage({ uid, page, sinceId }, signal);
+          break;
+        } catch (err) {
+          if (err.name === "AbortError") throw err;
+          if (err.code === "AUTH") throw err; // stop everything on auth failure
+          if (err.code === "RISK" && attempt < CONFIG.MAX_PAGE_RETRY) {
+            onLog(
+              `第 ${page} 页被限流: ${err.message}，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
+              "warn"
+            );
+            await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+            continue;
+          }
+          onLog(`第 ${page} 页拉取失败: ${err.message}，终止扫描。`, "error");
+          pageData = null;
+          break;
+        }
       }
+      if (!pageData) break;
 
       const list = pageData.list || [];
       if (list.length === 0) {
@@ -380,9 +414,18 @@
               onLog(`鉴权失败，终止: ${err.message}`, "error");
               throw err;
             }
-            if (err.code === "RISK" && attempt >= CONFIG.MAX_RETRY) {
-              onLog(`✗ 风控/失败 [${mid}]: ${err.message}（已达最大重试）`, "error");
-              break;
+            if (err.code === "RISK") {
+              // Rate-limited: needs a long pause, not a short backoff.
+              if (attempt >= CONFIG.MAX_RETRY) {
+                onLog(`✗ 风控/失败 [${mid}]: ${err.message}（已达最大重试）`, "error");
+                break;
+              }
+              onLog(
+                `限流 [${mid}]，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_RETRY}）`,
+                "warn"
+              );
+              await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+              continue;
             }
             const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
             onLog(`重试 [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
@@ -410,6 +453,8 @@
         break;
       }
       page++;
+      // Throttle pagination to avoid tripping weibo's rate limiter.
+      await sleep(CONFIG.PAGE_DELAY_MS, signal);
     }
 
     onLog(
@@ -786,7 +831,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.2.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.3.0</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -826,7 +871,7 @@
         </div>
 
         <div class="wbl-section">
-          <span class="wbl-label">每条延时（秒，随机±20%）</span>
+          <span class="wbl-label">每条修改延时（秒，随机±20%）· 翻页固定 0.8s</span>
           <input type="number" id="wbl-delay" value="1.5" min="0.5" step="0.1" style="width:80px">
         </div>
 
