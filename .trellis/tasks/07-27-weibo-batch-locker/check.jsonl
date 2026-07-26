@@ -1,0 +1,3 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md", "reason": "校验接口参数(ids/visible 字符串)、visible.type===1 跳过判定、x-xsrf-token 头"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "校验 UI/API/执行器层数据流一致性"}
