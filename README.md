@@ -24,7 +24,11 @@
 ## 安装
 
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)（篡改猴）
-2. Tampermonkey 面板 → 新建脚本 → 粘贴 [`scripts/weibo-batch-locker.user.js`](./scripts/weibo-batch-locker.user.js) 的全部内容 → 保存（Ctrl+S）
+2. 点击下面的安装链接,Tampermonkey 会自动弹出安装面板 → 确认安装即可:
+
+   👉 **[一键安装脚本](https://raw.githubusercontent.com/wang93wei/lock-weibo/main/scripts/weibo-batch-locker.user.js)**
+
+   > 若 raw 链接打开是纯文本、没弹安装面板,可手动操作:Tampermonkey 面板 → 新建脚本 → 粘贴该文件全部内容 → 保存(Ctrl+S)。
 
 ## 使用
 
