@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.5.0
+// @version      0.5.1
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @match        https://weibo.com/*
@@ -158,6 +158,17 @@
         );
       }
     });
+  }
+
+  /**
+   * Yield to the browser so it can paint pending DOM changes (log lines,
+   * counters). Without this, a tight await-loop keeps deferring repaints and
+   * the panel appears frozen even though requests are firing (visible in F12).
+   * requestAnimationFrame resolves before the next paint; the outer setTimeout
+   * guarantees the macrotask boundary browsers need to actually render.
+   */
+  function yieldToRender() {
+    return new Promise((resolve) => requestAnimationFrame(() => resolve()));
   }
 
   /** Random delay around `baseSec` (±20%). */
@@ -440,9 +451,12 @@
 
       const matched = applyFilter(list, filterCfg);
       stats.scanned += list.length;
+      onProgress({ ...stats });
+      await yieldToRender();
 
       for (const blog of matched) {
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        await yieldToRender(); // let the browser paint log/counters
 
         const mid = String(blog.mid || blog.id);
         const day = toDayStr(parseWeiboDate(blog.created_at));
@@ -552,6 +566,7 @@
 
     for (const item of hits) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      await yieldToRender(); // let the browser paint log/counters
       const mid = String(item.mid);
       const day = item.date || "";
 
@@ -972,7 +987,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.5.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.5.1</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
