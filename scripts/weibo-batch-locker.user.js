@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/weibo/weibo-batch-locker
-// @version      0.3.0
+// @version      0.4.0
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @match        https://weibo.com/*
@@ -37,9 +37,13 @@
   // ===========================================================================
   const CONFIG = {
     PAGE_SIZE: 20, // mymblog returns ~20 per page
-    DEFAULT_DELAY_SEC: 1.5, // delay between each modifyVisible call
-    PAGE_DELAY_MS: 800, // delay between pagination requests (dry-run + run)
-    RATE_LIMITED_WAIT_MS: 30000, // pause length when weibo rate-limits us
+    // Sliding-window rate limiter (global, covers both mymblog + modifyVisible).
+    // Allows at most RATE_MAX requests within any RATE_WINDOW_MS window.
+    // Default ~3 req / 10s ≈ one request every ~3.3s on average.
+    RATE_WINDOW_MS: 10000,
+    RATE_MAX: 3,
+    DEFAULT_DELAY_SEC: 1.5, // legacy: min gap hint (window already enforces pacing)
+    RATE_LIMITED_WAIT_MS: 30000, // pause length when weibo itself rate-limits us
     MAX_RETRY: 3, // retries per weibo on transient errors
     MAX_PAGE_RETRY: 3, // retries on a rate-limited page before giving up
     RETRY_BASE_WAIT_MS: 2000, // exponential backoff base
@@ -161,6 +165,55 @@
     return Math.round(baseSec * (0.8 + Math.random() * 0.4) * 1000);
   }
 
+  /**
+   * Sliding-window rate limiter. Throttles ALL outbound weibo requests
+   * (mymblog pagination + modifyVisible) so that at most `max` requests happen
+   * within any trailing `windowMs` window. This mirrors how platforms actually
+   * detect abuse (request density over time), which fixed inter-request delays
+   * only approximate.
+   *
+   * Usage: `await rateLimiter.acquire(signal)` before every network call.
+   * Returns the ms it waited (0 if no wait).
+   */
+  function createRateLimiter(windowMs, max) {
+    const timestamps = []; // ms timestamps of admitted requests, ascending
+    let cfgWindow = windowMs;
+    let cfgMax = max;
+    return {
+      async acquire(signal) {
+        while (true) {
+          if (signal && signal.aborted)
+            throw new DOMException("Aborted", "AbortError");
+          const now = Date.now();
+          // Drop timestamps that fell out of the window.
+          while (timestamps.length && now - timestamps[0] >= cfgWindow) {
+            timestamps.shift();
+          }
+          if (timestamps.length < cfgMax) {
+            timestamps.push(now);
+            return;
+          }
+          // Window full: wait until the oldest request ages out, then re-check.
+          const wait = cfgWindow - (now - timestamps[0]) + 5;
+          await sleep(wait, signal);
+        }
+      },
+      /** Reconfigure at runtime (e.g. when the user changes the panel input). */
+      setMax(m) {
+        cfgMax = Math.max(1, Math.floor(m));
+      },
+      // Test/inspect helper: how many requests are currently in-window.
+      _inWindow() {
+        const now = Date.now();
+        while (timestamps.length && now - timestamps[0] >= cfgWindow) timestamps.shift();
+        return timestamps.length;
+      },
+    };
+  }
+
+  // Single global limiter instance shared by all requests in this page session.
+  const rateLimiter = createRateLimiter(CONFIG.RATE_WINDOW_MS, CONFIG.RATE_MAX);
+
   // ===========================================================================
   // API layer
   // ===========================================================================
@@ -176,6 +229,7 @@
 
   /** Fetch one page of the user's own weibo timeline. Returns data.data. */
   async function fetchBlogPage({ uid, page, sinceId }, signal) {
+    await rateLimiter.acquire(signal); // global sliding-window throttle
     const params = new URLSearchParams({ uid, page: String(page), feature: "0" });
     if (sinceId) params.set("since_id", String(sinceId));
     const url = `https://weibo.com/ajax/statuses/mymblog?${params.toString()}`;
@@ -214,6 +268,7 @@
 
   /** Set one weibo's visibility to "仅自己可见". */
   async function modifyVisible(mid, signal) {
+    await rateLimiter.acquire(signal); // global sliding-window throttle
     const body = new URLSearchParams({ ids: String(mid), visible: "1" });
     const res = await fetch("https://weibo.com/ajax/statuses/modifyVisible", {
       method: "POST",
@@ -311,16 +366,15 @@
   /**
    * @param {object}   opts
    * @param {string}   opts.uid
-   * @param {object}   opts.filterCfg   {type:"date"|"mid"|"recent", ...}
+   * @param {object}   opts.filterCfg   {type:"date"|"before"|"mid"|"recent", ...}
    * @param {boolean}  opts.dryRun      if true, never call modifyVisible
-   * @param {number}   opts.delaySec    delay between real modifications
    * @param {function} opts.onLog       (msg, level) -> void
    * @param {function} opts.onProgress  (stats) -> void
    * @param {AbortSignal} opts.signal
    * @returns {Promise<object>} stats { success, skipped, failed, scanned, hits }
    */
   async function runApiMode(opts) {
-    const { uid, filterCfg, dryRun, delaySec, onLog, onProgress, signal } = opts;
+    const { uid, filterCfg, dryRun, onLog, onProgress, signal } = opts;
     const stats = { success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
     let page = 1;
     let sinceId = null;
@@ -435,7 +489,9 @@
         if (!done) stats.failed++;
 
         onProgress({ ...stats });
-        await sleep(randomDelayMs(delaySec), signal);
+        // Human-like jitter on top of the window limiter, so request gaps
+        // aren't perfectly regular (regularity is itself a bot signal).
+        await sleep(randomDelayMs(1.0), signal);
       }
 
       // "recent N": stop once we have enough non-skipped hits.
@@ -453,8 +509,8 @@
         break;
       }
       page++;
-      // Throttle pagination to avoid tripping weibo's rate limiter.
-      await sleep(CONFIG.PAGE_DELAY_MS, signal);
+      // No extra sleep here: the global rateLimiter inside fetchBlogPage
+      // already paces pagination.
     }
 
     onLog(
@@ -564,6 +620,14 @@
     beforeMonthsEl.addEventListener("change", refreshBeforeCutoff);
     refreshBeforeCutoff();
 
+    // Rate limit: bind the panel input to the global limiter.
+    function syncRateLimit() {
+      const m = Math.max(1, parseInt(els.delay.value, 10) || CONFIG.RATE_MAX);
+      rateLimiter.setMax(m);
+    }
+    els.delay.addEventListener("change", syncRateLimit);
+    syncRateLimit();
+
     // logging
     function log(msg, level) {
       const line = document.createElement("div");
@@ -631,7 +695,6 @@
           uid,
           filterCfg: cfg,
           dryRun: true,
-          delaySec: parseFloat(els.delay.value) || CONFIG.DEFAULT_DELAY_SEC,
           onLog: log,
           onProgress: setCounts,
           signal: state.abortCtrl.signal,
@@ -663,7 +726,6 @@
           uid,
           filterCfg: cfg,
           dryRun: true,
-          delaySec: parseFloat(els.delay.value) || CONFIG.DEFAULT_DELAY_SEC,
           onLog: () => {},
           onProgress: setCounts,
           signal: state.abortCtrl.signal,
@@ -698,7 +760,6 @@
           uid,
           filterCfg: cfg,
           dryRun: false,
-          delaySec: parseFloat(els.delay.value) || CONFIG.DEFAULT_DELAY_SEC,
           onLog: log,
           onProgress: setCounts,
           signal: state.abortCtrl.signal,
@@ -831,7 +892,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.3.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.4.0</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -871,8 +932,10 @@
         </div>
 
         <div class="wbl-section">
-          <span class="wbl-label">每条修改延时（秒，随机±20%）· 翻页固定 0.8s</span>
-          <input type="number" id="wbl-delay" value="1.5" min="0.5" step="0.1" style="width:80px">
+          <span class="wbl-label">请求限速：每 10 秒最多
+            <input type="number" id="wbl-delay" value="3" min="1" max="10" step="1" style="width:50px;display:inline-block;vertical-align:middle">
+            次请求</span>
+          <div class="wbl-hint">越小越保守（默认 3 ≈ 每 3.3 秒 1 次）。被风控过就调小到 1~2。</div>
         </div>
 
         <div class="wbl-btns">
