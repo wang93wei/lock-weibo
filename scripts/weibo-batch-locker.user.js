@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.4.0
+// @version      0.5.0
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @match        https://weibo.com/*
@@ -359,6 +359,23 @@
     }
   }
 
+  /** Structural equality of two filter configs (used to guard run-after-preview). */
+  function sameFilterCfg(a, b) {
+    if (!a || !b || a.type !== b.type) return false;
+    switch (a.type) {
+      case "date":
+        return (a.start || "") === (b.start || "") && (a.end || "") === (b.end || "");
+      case "before":
+        return Number(a.months) === Number(b.months);
+      case "mid":
+        return (a.startMid || "") === (b.startMid || "") && (a.endMid || "") === (b.endMid || "");
+      case "recent":
+        return Number(a.n) === Number(b.n);
+      default:
+        return false;
+    }
+  }
+
   // ===========================================================================
   // API executor (single source of truth for preview + run)
   // ===========================================================================
@@ -521,6 +538,78 @@
     return stats;
   }
 
+  /**
+   * Lock a list of weibos by mid, reusing the mids gathered during preview
+   * (avoids a second pagination sweep — halves request count + rate-limit exposure).
+   * Each item is re-checked for isPrivate so a manual state change between preview
+   * and run is respected.
+   *
+   * @param {Array<{mid:string, isPrivate:boolean, date?:string}>} hits
+   */
+  async function lockByIds(hits, { onLog, onProgress, signal }) {
+    const stats = { success: 0, skipped: 0, failed: 0, scanned: hits.length, hits };
+    onLog(`— 执行开始（真实修改），共 ${hits.length} 条 —`, "info");
+
+    for (const item of hits) {
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      const mid = String(item.mid);
+      const day = item.date || "";
+
+      if (item.isPrivate) {
+        stats.skipped++;
+        onLog(`跳过 [${mid}] ${day} (已是仅自己可见)`, "muted");
+        onProgress({ ...stats });
+        continue;
+      }
+
+      let done = false;
+      for (let attempt = 1; attempt <= CONFIG.MAX_RETRY; attempt++) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        try {
+          onLog(`处理中 [${mid}] 尝试 ${attempt}/${CONFIG.MAX_RETRY}`, "info");
+          await modifyVisible(mid, signal);
+          stats.success++;
+          onLog(`✓ 已锁定 [${mid}] ${day}`, "success");
+          done = true;
+          break;
+        } catch (err) {
+          if (err.name === "AbortError") throw err;
+          if (err.code === "AUTH") {
+            onLog(`鉴权失败，终止: ${err.message}`, "error");
+            throw err;
+          }
+          if (err.code === "RISK") {
+            if (attempt >= CONFIG.MAX_RETRY) {
+              onLog(`✗ 风控/失败 [${mid}]: ${err.message}（已达最大重试）`, "error");
+              break;
+            }
+            onLog(
+              `限流 [${mid}]，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_RETRY}）`,
+              "warn"
+            );
+            await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+            continue;
+          }
+          const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
+          onLog(`重试 [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
+          await sleep(wait, signal);
+        }
+      }
+      if (!done) stats.failed++;
+
+      onProgress({ ...stats });
+      // Human-like jitter on top of the window limiter, so request gaps
+      // aren't perfectly regular (regularity is itself a bot signal).
+      await sleep(randomDelayMs(1.0), signal);
+    }
+
+    onLog(
+      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 共 ${stats.hits.length}`,
+      "summary"
+    );
+    return stats;
+  }
+
   // ===========================================================================
   // UI (Shadow DOM)
   // ===========================================================================
@@ -543,6 +632,7 @@
     const state = {
       mode: "idle", // idle | previewing | running
       abortCtrl: null,
+      lastPreview: null, // { hits, filterCfg, at } from the most recent dry-run
     };
 
     const $ = (sel) => root.querySelector(sel);
@@ -699,7 +789,9 @@
           onProgress: setCounts,
           signal: state.abortCtrl.signal,
         });
+        state.lastPreview = { hits: stats.hits, filterCfg: cfg, at: Date.now() };
         log(`预览命中 ${stats.hits.length} 条（其中 ${stats.skipped} 条已是仅自己可见）`, "summary");
+        log(`点「执行」将直接锁定以上命中的微博（无需重新扫描）`, "info");
       } catch (e) {
         if (e.name === "AbortError") log("预览已停止", "warn");
         else if (e.code === "AUTH") log(`鉴权错误: ${e.message}（请重新登录）`, "error");
@@ -716,50 +808,38 @@
         log(err, "error");
         return;
       }
-      // Re-preview quietly to count hits first (cheap, no modification)
-      setMode("previewing");
-      state.abortCtrl = new AbortController();
-      log("— 先统计命中数量 —", "info");
-      let preStats;
-      try {
-        preStats = await runApiMode({
-          uid,
-          filterCfg: cfg,
-          dryRun: true,
-          onLog: () => {},
-          onProgress: setCounts,
-          signal: state.abortCtrl.signal,
-        });
-      } catch (e) {
-        if (e.name === "AbortError") log("已停止", "warn");
-        else log(`统计出错: ${e.message}`, "error");
-        setMode("idle");
+      // Reuse the mids from the last preview instead of re-scanning.
+      if (!state.lastPreview) {
+        log("请先点「预览」扫描命中微博，再点「执行」。", "warn");
         return;
       }
-      const toLock = preStats.hits.filter((h) => !h.isPrivate).length;
+      if (!sameFilterCfg(state.lastPreview.filterCfg, cfg)) {
+        log("筛选条件与上次预览不一致，请重新点「预览」后再执行。", "warn");
+        return;
+      }
+      const hits = state.lastPreview.hits;
+      const toLock = hits.filter((h) => !h.isPrivate).length;
+      const alreadyPrivate = hits.length - toLock;
       if (toLock === 0) {
-        log("没有需要锁定的微博（命中均为已锁定或空）", "summary");
-        setMode("idle");
+        log("命中的微博均已锁定，无需操作。", "summary");
         return;
       }
+      const ageMin = Math.round((Date.now() - state.lastPreview.at) / 60000);
       const ok = confirm(
         `将把 ${toLock} 条微博设为「仅自己可见」（可恢复）。\n` +
-          `其中已锁定的 ${preStats.skipped} 条会自动跳过。\n\n确认执行？`
+          `其中已锁定的 ${alreadyPrivate} 条会自动跳过。\n` +
+          (ageMin > 0 ? `（依据 ${ageMin} 分钟前的预览数据，如期间手动改动过，执行时会自动跳过/失败）\n` : "") +
+          `\n确认执行？`
       );
       if (!ok) {
         log("已取消执行", "warn");
-        setMode("idle");
         return;
       }
-      // Real run
+      // Real run: lock by the previewed mids directly (no re-scan).
       setMode("running");
       state.abortCtrl = new AbortController();
-      log("— 执行开始（真实修改）—", "info");
       try {
-        await runApiMode({
-          uid,
-          filterCfg: cfg,
-          dryRun: false,
+        await lockByIds(hits, {
           onLog: log,
           onProgress: setCounts,
           signal: state.abortCtrl.signal,
@@ -892,7 +972,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.4.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.5.0</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
