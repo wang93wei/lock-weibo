@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/weibo/weibo-batch-locker
-// @version      0.1.0
-// @description  在 weibo.com 登录态下，按「发布日期范围 / mid 范围 / 最近 N 条」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
+// @version      0.2.0
+// @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @match        https://weibo.com/*
 // @run-at       document-idle
@@ -89,6 +89,25 @@
     const m = String(d.getMonth() + 1).padStart(2, "0");
     const day = String(d.getDate()).padStart(2, "0");
     return `${d.getFullYear()}-${m}-${day}`;
+  }
+
+  /**
+   * Return today's YYYY-MM-DD shifted back by `months` whole months.
+   * Subtracts months by hand and CLAMPS the day to the target month's last
+   * day, because JS Date.setMonth overflows instead (Mar 31 - 1 month would
+   * become Mar 3, not Feb 28 — a real bug that would silently break filtering
+   * when "today" lands on the 29th/30th/31st).
+   * Examples: Jul 27 - 3 months -> "2026-04-27"; Mar 31 - 1 month -> "2026-02-28".
+   */
+  function cutoffDayMonthsAgo(months) {
+    const now = new Date();
+    let y = now.getFullYear();
+    let m = now.getMonth() - months; // 0-based; may go negative
+    while (m < 0) { m += 12; y -= 1; }
+    while (m > 11) { m -= 12; y += 1; }
+    const lastDay = new Date(y, m + 1, 0).getDate(); // day 0 of next month = last day of target
+    const day = Math.min(now.getDate(), lastDay);
+    return toDayStr(new Date(y, m, day));
   }
 
   /**
@@ -230,6 +249,22 @@
     });
   }
 
+  /**
+   * Relative-time filter: lock weibos published STRICTLY before (today - N months).
+   * `months` selects how far back; the cutoff is recomputed at call time, so the
+   * filter is always relative to "now" (dynamic locking).
+   * Matches weibos whose created_at day < cutoffDay (both as YYYYMMDD strings).
+   */
+  function byBeforeMonths(blogs, { months }) {
+    const cutoff = cutoffDayMonthsAgo(months); // "YYYY-MM-DD"
+    const cutoffNum = cutoff.replace(/-/g, ""); // "YYYYMMDD"
+    return blogs.filter((b) => {
+      const day = toDayStr(parseWeiboDate(b.created_at)).replace(/-/g, "");
+      if (!day) return false;
+      return day < cutoffNum;
+    });
+  }
+
   function byRecentN(blogs, { n }) {
     return blogs.slice(0, n); // mymblog is already newest-first
   }
@@ -239,6 +274,8 @@
     switch (cfg.type) {
       case "date":
         return byDateRange(blogs, cfg);
+      case "before":
+        return byBeforeMonths(blogs, cfg);
       case "mid":
         return byMidRange(blogs, cfg);
       case "recent":
@@ -412,6 +449,7 @@
       filterRadios: Array.from(root.querySelectorAll('input[name="wbl-filter"]')),
       filterPanels: {
         date: $("#wbl-date-panel"),
+        before: $("#wbl-before-panel"),
         mid: $("#wbl-mid-panel"),
         recent: $("#wbl-recent-panel"),
       },
@@ -447,6 +485,12 @@
           end: $("#wbl-date-end").value.trim(),
         };
       }
+      if (type === "before") {
+        return {
+          type: "before",
+          months: parseInt($("#wbl-before-months").value, 10) || 1,
+        };
+      }
       if (type === "mid") {
         return {
           type: "mid",
@@ -464,6 +508,16 @@
     }
     els.filterRadios.forEach((r) => r.addEventListener("change", syncFilterPanels));
     syncFilterPanels();
+
+    // "时间预设": show the dynamically computed cutoff day next to the dropdown.
+    const beforeCutoffEl = $("#wbl-before-cutoff");
+    const beforeMonthsEl = $("#wbl-before-months");
+    function refreshBeforeCutoff() {
+      const m = parseInt(beforeMonthsEl.value, 10) || 1;
+      beforeCutoffEl.textContent = `（锁定 ${cutoffDayMonthsAgo(m)} 及更早）`;
+    }
+    beforeMonthsEl.addEventListener("change", refreshBeforeCutoff);
+    refreshBeforeCutoff();
 
     // logging
     function log(msg, level) {
@@ -492,7 +546,7 @@
       els.runBtn.disabled = busy;
       els.stopBtn.disabled = !busy;
       els.clearBtn.disabled = busy;
-      root.querySelectorAll("input").forEach((i) => (i.disabled = busy));
+      root.querySelectorAll("input, select").forEach((i) => (i.disabled = busy));
     }
 
     function validateCfg(cfg) {
@@ -509,6 +563,9 @@
         if (cfg.endMid && !/^\d+$/.test(cfg.endMid)) return "结束 mid 应为纯数字";
         if (cfg.startMid && cfg.endMid && cmpMid(cfg.startMid, cfg.endMid) > 0)
           return "起始 mid 不能大于结束 mid";
+      }
+      if (cfg.type === "before") {
+        if (!(cfg.months >= 1)) return "时间预设的月数应大于 0";
       }
       return null;
     }
@@ -685,11 +742,11 @@
     .wbl-radios { display: flex; gap: 12px; flex-wrap: wrap; }
     .wbl-radios label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
     .wbl-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
-    .wbl-panel input[type=text], .wbl-panel input[type=date], .wbl-panel input[type=number] {
+    .wbl-panel input[type=text], .wbl-panel input[type=date], .wbl-panel input[type=number], .wbl-panel select {
       background: #2c313a; border: 1px solid #3a3f4b; color: #e6e6e6;
       border-radius: 5px; padding: 4px 7px; font-size: 12px; width: 100%;
     }
-    .wbl-panel input:disabled { opacity: .5; }
+    .wbl-panel input:disabled, .wbl-panel select:disabled { opacity: .5; }
     .wbl-btns { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
     .wbl-btn {
       flex: 1; min-width: 70px; padding: 7px 8px; border-radius: 6px; border: none;
@@ -729,7 +786,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.1.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.2.0</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -739,12 +796,22 @@
           <span class="wbl-label">筛选方式</span>
           <div class="wbl-radios">
             <label><input type="radio" name="wbl-filter" value="recent" checked> 最近N条</label>
+            <label><input type="radio" name="wbl-filter" value="before"> 时间预设</label>
             <label><input type="radio" name="wbl-filter" value="date"> 日期范围</label>
             <label><input type="radio" name="wbl-filter" value="mid"> mid范围</label>
           </div>
           <div id="wbl-recent-panel" class="wbl-row">
             <input type="number" id="wbl-recent-n" value="10" min="1" placeholder="N">
             <span class="wbl-hint" style="margin:0">条（按时间倒序）</span>
+          </div>
+          <div id="wbl-before-panel" class="wbl-row" style="display:none">
+            <select id="wbl-before-months">
+              <option value="1">1 个月前</option>
+              <option value="3" selected>3 个月前</option>
+              <option value="6">半年前 (6个月)</option>
+              <option value="12">1 年前 (12个月)</option>
+            </select>
+            <span class="wbl-hint" id="wbl-before-cutoff" style="margin:0"></span>
           </div>
           <div id="wbl-date-panel" class="wbl-row" style="display:none">
             <input type="date" id="wbl-date-start" placeholder="起始">
