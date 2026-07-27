@@ -145,7 +145,85 @@ Body: ids=<mid>&visible=1
    - 单次 `mymblog` 每页固定返回 ~20 条，**无法用参数增大**（PC web 端写死）。扫描一年（约 240 条）需翻 ~12 页，按默认限速约需 40s。
 5. **不可逆操作**：仅自己可见可恢复（type 1 ↔ 0 可双向），但付费会员可见（3）不可逆——本任务只做 1，安全。
 
-## 6. 参考资料
+## 6. searchProfile — 服务端按时间筛选接口（实测 2026-07-27）
+
+微博前端「按发布时间筛选」走的是 `searchProfile`，可由服务端按 `starttime`/`endtime`
+（Unix 秒，**+0800 本地时区语义**）直接过滤，**无需客户端逐页拉取再过滤**。对"时间预设/
+日期范围"场景，比 `mymblog` 全量分页省一两个数量级的请求配额。
+
+**请求**
+```
+GET https://weibo.com/ajax/statuses/searchProfile
+  ?uid=<uid>
+  &page=1                 # ⚠️ 实测恒为 1，page 参数被忽略（见下「分页」）
+  &endtime=<unix秒>       # 含，+0800 时区；推进游标靠缩小它
+  [&starttime=<unix秒>]   # 可选，省略 = 不设下界（实测可工作）
+  [&hasori=1&hasret=1&hastext=1&haspic=1&hasvideo=1&hasmusic=1]
+Header: x-requested-with: XMLHttpRequest
+Header: x-xsrf-token: <XSRF-TOKEN>
+  Header: referer: https://weibo.com/u/<uid>     # ⚠️ 服务端校验，缺失则 403
+                                                  #   userscript 同源 fetch 时浏览器自动发送，无需手动设
+```
+
+**`has*` 参数（可选）**：内容类型筛选器（原创/转发/纯文本/图/视频/音乐）。
+**与可见性无关**——实测同时间窗去掉全部 `has*`，结果完全一致（含 type=1 私有微博）。
+纯时间筛选时全部省略，URL 更短。
+
+**实测响应结构**（窗口 2024-09-22 一天内，账号含 1 条 type=1 私有微博）
+```jsonc
+{
+  "ok": 1,
+  "data": {
+    "list": [ /* 与 mymblog 单条结构相同：id/idstr/mid/mblogid/visible{type,list_id}/created_at/text_raw/... */ ],
+    "total": 6,        // 窗口命中总数（示例；total==0 表示窗口内无微博）
+    "absstr": "..."    // 时间筛选的展示用字符串，无关
+    // ⚠️ 无 since_id 字段
+  }
+}
+```
+
+**分页（实测，重要，反直觉）**：接口排序为**新→旧**，单页固定返回 **50 条**
+（不是 mymblog 的 20）。窗口内微博超过 50 条时，**`page`、`max_id`、`since_id`
+三个参数全部被服务端忽略**——实测对同一宽窗口（uid=1238726882，2025 H1，total=134）
+分别请求 `page=1/2/3`、`&max_id=<最旧mid>`、`&since_id=<最旧mid>`，六次返回的
+50 条 mid 序列**逐字节相同**，`total` 也基本不变。
+
+→ **唯一能推进游标的是缩小 `endtime`**：取本页**最旧一条**的 `created_at`
+转 Unix 秒，作为下一页的 `endtime`，`page` 恒为 1，循环直到取空。
+- 同秒碰撞兜底：维护 `seenMids = new Set()`，若某页**无任何新 mid**（全是已见过的）
+则判定到底，避免 `endtime` 停在同一秒导致死循环。
+- 终止条件三选一：`list.length === 0`、本页无新 mid、或达 `MAX_PAGES_FALLBACK` 上限。
+
+**可见性覆盖（关键，实测）**：`searchProfile` **能搜出 type=1「仅自己可见」的微博**
+（mid=5081417737047965 实测命中）。对"批量锁定"场景完全可用——既不会漏掉已私有的（
+重复锁定会被脚本跳过），也能精准命中窗口内所有待锁微博。
+
+**风控差异（实测，关键）**：`searchProfile` 比 `mymblog` 严——服务端**校验 `Referer` 头**。
+矩阵实测（同 uid/时间窗/cookie，仅变 header 组合）：
+
+| Referer | User-Agent | Cookies | 结果 |
+|---|---|---|---|
+| ✗ | ✓ | ✓ | **403 `{"error":"Forbidden"}`** |
+| ✓ | ✗ | ✓ | **200 OK**（返回完整 list） |
+| ✗ | ✗ | ✓ | **403 Forbidden** |
+| ✓ | ✓ | ✗ | 200 但 `ok:-100`（重定向登录）|
+
+→ 决定性的是 **`Referer`**，有无 `User-Agent` 无所谓。`mymblog` 不做此校验。
+**对脚本无影响**：脚本运行在 `weibo.com/u/<uid>` 页面，同源 `fetch` 时浏览器**自动**发送
+`Referer: https://weibo.com/u/<uid>`（Referer 是 forbidden header，无法手动设，但默认值
+正是服务端要的）。故代码侧与 `fetchBlogPage` 完全一致（只带 `x-xsrf-token` +
+`x-requested-with`），无需额外处理。仍走全局滑动窗口限流器。
+注意若用户把面板拖到非 `/u/<uid>` 页（如首页），Referer 可能不达标 → 403；脚本应在
+`getUid()` 取不到时已提示用户回到 `/u/<uid>`。
+
+**Unix 时间戳换算**：`starttime`/`endtime` 是 +0800 本地时区的 Unix 秒。
+JS：`Math.floor(localDate.getTime()/1000)`（`Date.parse` 已按本地时区解析）。
+- 用户选「日期范围」`start..end`：`starttime = start 00:00:00`，
+  `endtime = end 23:59:59`（含当天，避免丢当日晚间的微博）。
+- 用户选「时间预设 N 个月」：`endtime = (今天 - N 月) 00:00:00`，
+  `starttime` 省略（不设下界）。
+
+## 7. 参考资料
 
 - 微博客服「微博可见性变更功能相关问题」https://kefu.weibo.com/faqdetail?id=21092
 - 第三方实现（部分描述与现网不符，仅供对照）https://github.com/ByteRax/WeiBoHideTool

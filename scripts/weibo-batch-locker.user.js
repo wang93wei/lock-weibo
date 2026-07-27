@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.5.1
+// @version      0.6.0
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @match        https://weibo.com/*
@@ -96,6 +96,24 @@
     const m = String(d.getMonth() + 1).padStart(2, "0");
     const day = String(d.getDate()).padStart(2, "0");
     return `${d.getFullYear()}-${m}-${day}`;
+  }
+
+  /**
+   * "YYYY-MM-DD" -> Unix seconds (+0800 local timezone, as Weibo's
+   * searchProfile expects). `endOfDay=true` returns 23:59:59 of that day so a
+   * user's end date includes the whole day; otherwise 00:00:00.
+   * Returns null on bad input.
+   */
+  function dateStrToEpochSec(dateStr, endOfDay) {
+    if (!dateStr || !/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return null;
+    const parts = dateStr.split("-").map(Number);
+    const d = new Date(parts[0], parts[1] - 1, parts[2], endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0);
+    return Math.floor(d.getTime() / 1000);
+  }
+
+  /** Current time as Unix seconds. */
+  function nowEpochSec() {
+    return Math.floor(Date.now() / 1000);
   }
 
   /**
@@ -307,6 +325,56 @@
       throw e;
     }
     return data;
+  }
+
+  /**
+   * Fetch one page of the user's own weibos filtered server-side by time range
+   * via searchProfile. Returns data.data. Used by "时间预设"/"日期范围" filters
+   * to avoid the cost of full-timeline pagination that mymblog would require.
+   *
+   * NOTE on pagination (verified 2026-07-27): `page`, `max_id`, `since_id` are
+   * ALL ignored by this endpoint — only `endtime` moves the cursor (results are
+   * newest-first; callers shrink `endtime` to the oldest item's created_at to
+   * fetch the next slice). `page` is therefore pinned to 1 here; the loop lives
+   * in runApiModeSearchProfile. `Referer` is validated server-side but the
+   * browser sets it automatically for same-origin fetch, so nothing extra is
+   * needed vs fetchBlogPage.
+   */
+  async function fetchSearchProfilePage({ uid, starttime, endtime }, signal) {
+    await rateLimiter.acquire(signal); // global sliding-window throttle
+    const params = new URLSearchParams({ uid, page: "1" });
+    if (starttime) params.set("starttime", String(starttime));
+    if (endtime) params.set("endtime", String(endtime));
+    const url = `https://weibo.com/ajax/statuses/searchProfile?${params.toString()}`;
+    const res = await fetch(url, {
+      headers: apiHeaders(false),
+      credentials: "include",
+      signal,
+    });
+    if (res.status === 403) {
+      const e = new Error("Cookie 已过期或未登录 (HTTP 403)");
+      e.code = "AUTH";
+      throw e;
+    }
+    if (res.status === 414 || res.status === 429) {
+      const e = new Error(`访问频次过快，被微博限流 (HTTP ${res.status})`);
+      e.code = "RISK";
+      throw e;
+    }
+    if (!res.ok) throw new Error(`searchProfile HTTP ${res.status}`);
+    const data = await res.json();
+    if (data.ok !== 1) {
+      const msg = data.msg || "";
+      const e = new Error(`searchProfile ok=${data.ok} ${msg}`.trim());
+      if (/频次|频繁|过快|limit|too many/i.test(msg)) e.code = "RISK";
+      else if (data.ok === -100 || /login|登录/i.test(msg)) e.code = "AUTH";
+      else e.code = "API";
+      throw e;
+    }
+    if (!data.data || !Array.isArray(data.data.list)) {
+      throw new Error("searchProfile 响应结构异常");
+    }
+    return data.data;
   }
 
   // ===========================================================================
@@ -553,10 +621,150 @@
   }
 
   /**
+   * Preview collector for time-range filters ("时间预设"/"日期范围"). Uses the
+   * searchProfile endpoint so the server does the date filtering — far fewer
+   * requests than mymblog full-pagination + client-side filter.
+   *
+   * Stats/hits shape matches runApiMode so lockByIds reuses them unchanged.
+   * Always behaves as a dry-run collector (real locking is lockByIds's job);
+   * the `dryRun` flag only toggles the startup log line, kept for signature
+   * parity with runApiMode.
+   *
+   * Pagination (verified, see fetchSearchProfilePage + research notes): the
+   * endpoint ignores page/max_id/since_id, so we shrink `endtime` to the oldest
+   * item's created_at each iteration until empty or no new mids surface.
+   *
+   * @param {object} opts
+   * @param {string}  opts.uid
+   * @param {number}  [opts.starttime]  unix sec; omit = no lower bound
+   * @param {number}  opts.endtime      unix sec
+   * @param {function} opts.onLog
+   * @param {function} opts.onProgress
+   * @param {AbortSignal} opts.signal
+   * @returns {Promise<object>} stats
+   */
+  async function runApiModeSearchProfile(opts) {
+    const { uid, starttime, endtime, onLog, onProgress, signal } = opts;
+    const stats = { success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
+    const seenMids = new Set();
+    let curEnd = endtime;
+    let slice = 0;
+
+    onLog(
+      `【预览模式】用 searchProfile 按时间服务端筛选（不会修改任何微博）...` +
+        (starttime ? ` 区间: ${starttime}~${endtime}` : ` 截止: ${endtime}`),
+      "info"
+    );
+
+    while (slice < CONFIG.MAX_PAGES_FALLBACK) {
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      slice++;
+
+      // Fetch this time slice, retrying on rate-limit with a long pause.
+      let pageData = null;
+      for (let attempt = 1; attempt <= CONFIG.MAX_PAGE_RETRY; attempt++) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        try {
+          pageData = await fetchSearchProfilePage({ uid, starttime, endtime: curEnd }, signal);
+          break;
+        } catch (err) {
+          if (err.name === "AbortError") throw err;
+          if (err.code === "AUTH") throw err;
+          if (err.code === "RISK" && attempt < CONFIG.MAX_PAGE_RETRY) {
+            onLog(
+              `第 ${slice} 段被限流: ${err.message}，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
+              "warn"
+            );
+            await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+            continue;
+          }
+          onLog(`第 ${slice} 段拉取失败: ${err.message}，终止扫描。`, "error");
+          pageData = null;
+          break;
+        }
+      }
+      if (!pageData) break;
+
+      const list = pageData.list || [];
+      if (list.length === 0) {
+        onLog(`已扫描全部微博（第 ${slice} 段为空），结束。`, "info");
+        break;
+      }
+
+      stats.scanned += list.length;
+      onProgress({ ...stats });
+      await yieldToRender();
+
+      // Process only mids not seen in a prior slice. Dedup is mandatory: when
+      // curEnd lands on an item whose created_at equals the boundary, that
+      // item reappears next slice and would loop forever without this guard.
+      let newCount = 0;
+      let oldestEpoch = null;
+      for (const blog of list) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        await yieldToRender();
+
+        const mid = String(blog.mid || blog.id);
+        // Track the oldest (smallest epoch) seen this slice for cursor advance.
+        const t = parseWeiboDate(blog.created_at);
+        const epoch = t ? Math.floor(t.getTime() / 1000) : null;
+        if (epoch != null && (oldestEpoch == null || epoch < oldestEpoch)) oldestEpoch = epoch;
+
+        if (seenMids.has(mid)) continue; // already collected in an earlier slice
+        seenMids.add(mid);
+        newCount++;
+
+        const day = toDayStr(t);
+        const preview = {
+          mid,
+          date: day,
+          visible: visibleText(blog),
+          isPrivate: isPrivate(blog),
+          text: (blog.text_raw || "").slice(0, 40),
+        };
+        stats.hits.push(preview);
+
+        if (isPrivate(blog)) {
+          stats.skipped++;
+          onLog(`跳过 [${mid}] ${day} (已是仅自己可见)`, "muted");
+        } else {
+          onLog(`命中 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
+        }
+        onProgress({ ...stats });
+      }
+
+      if (newCount === 0) {
+        // Every item this slice was already seen → curEnd didn't move past a
+        // real boundary (same-second collision). Stop to avoid an infinite loop.
+        onLog(`本段无新微博（已全部覆盖），结束扫描。`, "info");
+        break;
+      }
+
+      if (oldestEpoch == null || oldestEpoch >= curEnd) {
+        // Couldn't find a strictly-older timestamp to advance to; stop.
+        onLog(`无法继续推进时间游标，结束扫描。`, "info");
+        break;
+      }
+      curEnd = oldestEpoch;
+    }
+
+    onLog(
+      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 命中 ${stats.hits.length}` +
+        "（预览，未实际修改）",
+      "summary"
+    );
+    return stats;
+  }
+
+  /**
    * Lock a list of weibos by mid, reusing the mids gathered during preview
    * (avoids a second pagination sweep — halves request count + rate-limit exposure).
-   * Each item is re-checked for isPrivate so a manual state change between preview
-   * and run is respected.
+   *
+   * NOTE: items already marked isPrivate in the preview snapshot are skipped
+   * silently (the per-item "跳过" log was already emitted during preview — logging
+   * it again here just floods the panel). isPrivate here is the PREVIEW value,
+   * not re-fetched at run time; if you change a post's visibility manually
+   * between preview and run, that change is NOT re-checked.
    *
    * @param {Array<{mid:string, isPrivate:boolean, date?:string}>} hits
    */
@@ -571,8 +779,10 @@
       const day = item.date || "";
 
       if (item.isPrivate) {
+        // 预览阶段已为「已是仅自己可见」逐条打过日志，执行阶段静默跳过即可，
+        // 避免把同样的"跳过"日志再刷一遍（仅累加 skipped 计数，最终 summary 汇总）。
+        // 注意：此处的 isPrivate 是预览快照值，并非执行时重新拉取的最新状态。
         stats.skipped++;
-        onLog(`跳过 [${mid}] ${day} (已是仅自己可见)`, "muted");
         onProgress({ ...stats });
         continue;
       }
@@ -796,14 +1006,50 @@
       state.abortCtrl = new AbortController();
       log("— 预览开始 —", "info");
       try {
-        const stats = await runApiMode({
-          uid,
-          filterCfg: cfg,
-          dryRun: true,
-          onLog: log,
-          onProgress: setCounts,
-          signal: state.abortCtrl.signal,
-        });
+        let stats;
+        if (cfg.type === "date" || cfg.type === "before") {
+          // Time-range filters: let the server do the date filtering via
+          // searchProfile instead of pulling the whole timeline.
+          let spOpts;
+          if (cfg.type === "date") {
+            if (!cfg.start && !cfg.end) {
+              log("请至少填写起始或结束日期。", "error");
+              setMode("idle");
+              return;
+            }
+            spOpts = {
+              uid,
+              starttime: cfg.start ? dateStrToEpochSec(cfg.start, false) : undefined,
+              endtime: cfg.end ? dateStrToEpochSec(cfg.end, true) : nowEpochSec(),
+              onLog: log,
+              onProgress: setCounts,
+              signal: state.abortCtrl.signal,
+            };
+          } else {
+            // "时间预设 N 个月前": lock everything strictly older than cutoff.
+            const cutoffDay = cutoffDayMonthsAgo(Number(cfg.months));
+            spOpts = {
+              uid,
+              starttime: undefined, // no lower bound
+              endtime: dateStrToEpochSec(cutoffDay, false),
+              onLog: log,
+              onProgress: setCounts,
+              signal: state.abortCtrl.signal,
+            };
+          }
+          stats = await runApiModeSearchProfile(spOpts);
+        } else {
+          // "recent N" / "mid 范围": no server-side equivalent, fall back to
+          // full mymblog pagination + client-side filter.
+          stats = await runApiMode({
+            uid,
+            filterCfg: cfg,
+            dryRun: true,
+            onLog: log,
+            onProgress: setCounts,
+            signal: state.abortCtrl.signal,
+          });
+        }
         state.lastPreview = { hits: stats.hits, filterCfg: cfg, at: Date.now() };
         log(`预览命中 ${stats.hits.length} 条（其中 ${stats.skipped} 条已是仅自己可见）`, "summary");
         log(`点「执行」将直接锁定以上命中的微博（无需重新扫描）`, "info");
@@ -987,7 +1233,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.5.1</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.6.0</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
