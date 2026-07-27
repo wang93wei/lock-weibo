@@ -190,9 +190,15 @@ Header: x-xsrf-token: <XSRF-TOKEN>
 
 → **唯一能推进游标的是缩小 `endtime`**：取本页**最旧一条**的 `created_at`
 转 Unix 秒，作为下一页的 `endtime`，`page` 恒为 1，循环直到取空。
+- ⚠️ **游标必须用 `oldestEpoch - 1`（不含边界）**：若直接 `endtime = oldestEpoch`，
+  下一页会**再返回边界那 1 条**（实测 2026-07-28：首包 total=15/list=15，次包 list=1 重复 mid），
+  导致「已扫描」虚高（15+1=16）并多一次无用请求。
+- **优先用 `data.total` 收尾**：当已收集 unique mids ≥ `total` 时立即停，不必再发下一页。
 - 同秒碰撞兜底：维护 `seenMids = new Set()`，若某页**无任何新 mid**（全是已见过的）
-则判定到底，避免 `endtime` 停在同一秒导致死循环。
-- 终止条件三选一：`list.length === 0`、本页无新 mid、或达 `MAX_PAGES_FALLBACK` 上限。
+则判定到底，避免死循环。
+- 终止条件：`list.length === 0`、本页无新 mid、`hits >= total`、游标低于 `starttime`、
+  或达 `MAX_PAGES_FALLBACK` 上限。
+- 「已扫描」只计 **unique mid**，不要对每页 `list.length` 累加（会把边界重拉算进去）。
 
 **可见性覆盖（关键，实测）**：`searchProfile` **能搜出 type=1「仅自己可见」的微博**
 （mid=5081417737047965 实测命中）。对"批量锁定"场景完全可用——既不会漏掉已私有的（
@@ -223,7 +229,38 @@ JS：`Math.floor(localDate.getTime()/1000)`（`Date.parse` 已按本地时区解
 - 用户选「时间预设 N 个月」：`endtime = (今天 - N 月) 00:00:00`，
   `starttime` 省略（不设下界）。
 
-## 7. 参考资料
+## 7. 请求头对齐 weibo-pro-next（2026-07-28 实测）
+
+官方 axios 拦截器（bundle `index-BLM88guT.js`）对业务 XHR 注入：
+
+```js
+// 页面 boot 注入：
+window.$VERSION = { CLIENT: '3.0.0', SERVER: 'v2026.07.23.1' };
+
+// axios request interceptor:
+headers['client-version'] = window.$VERSION.CLIENT
+headers['server-version'] = window.$VERSION.SERVER
+// 另有 traceparent（W3C trace context）
+```
+
+脚本侧应对齐的 **可设置** 头：
+
+| Header | 来源 |
+|---|---|
+| `accept` | `application/json, text/plain, */*` |
+| `client-version` | `window.$VERSION.CLIENT`（fallback scrape / 常量） |
+| `server-version` | `window.$VERSION.SERVER`（fallback scrape / 常量） |
+| `traceparent` | 每次请求随机 `00-<32hex>-<16hex>-00` |
+| `x-requested-with` | `XMLHttpRequest` |
+| `x-xsrf-token` | cookie `XSRF-TOKEN` |
+| `content-type` | POST 时 `application/x-www-form-urlencoded` |
+
+**不要**手动设置（Fetch forbidden / 浏览器自动带）：`cookie`、`user-agent`、`referer`、
+`sec-fetch-*`、`accept-language`。同源 `credentials:"include"` 即可。
+
+不必模拟 `/ajax/log/action` 埋点请求（那是前端打点，不是业务鉴权依赖）。
+
+## 8. 参考资料
 
 - 微博客服「微博可见性变更功能相关问题」https://kefu.weibo.com/faqdetail?id=21092
 - 第三方实现（部分描述与现网不符，仅供对照）https://github.com/ByteRax/WeiBoHideTool

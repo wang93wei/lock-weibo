@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.6.0
+// @version      0.6.5
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @match        https://weibo.com/*
@@ -147,9 +147,10 @@
     return a < b ? -1 : a > b ? 1 : 0;
   }
 
-  /** True if the weibo is already "仅自己可见". Always returns a boolean. */
+  /** True if the weibo is already "仅自己可见". Always returns a boolean.
+   *  Coerces type so both number 1 and string "1" count (API drift has done both). */
   function isPrivate(blog) {
-    return Boolean(blog && blog.visible && blog.visible.type === CONFIG.PRIVATE_TYPE);
+    return Boolean(blog && blog.visible && Number(blog.visible.type) === CONFIG.PRIVATE_TYPE);
   }
 
   function visibleText(blog) {
@@ -247,8 +248,100 @@
   // API layer
   // ===========================================================================
 
+  /**
+   * Match weibo-pro-next XHR headers (verified 2026-07-28 on mymblog/searchProfile):
+   *   accept, client-version, server-version, traceparent, x-requested-with, x-xsrf-token
+   * Browser auto-fills cookie / user-agent / referer / sec-fetch-* / accept-language
+   * when fetch() runs same-origin with credentials:"include" — do NOT set those
+   * (several are forbidden header names in the Fetch spec).
+   *
+   * Official axios interceptor (weibo-pro-next bundle) does exactly:
+   *   headers["client-version"] = window.$VERSION.CLIENT
+   *   headers["server-version"] = window.$VERSION.SERVER
+   * Page boots with:
+   *   window.$VERSION = { CLIENT: "3.0.0", SERVER: "v2026.07.23.1" }
+   * We mirror that; scrape / fallback only if $VERSION is missing (early boot).
+   */
+  const CLIENT_VERSION_FALLBACK = "3.0.0";
+  const SERVER_VERSION_FALLBACK = "v2026.07.23.1";
+  let cachedClientVersion = null;
+  let cachedServerVersion = null;
+
+  /** Read window.$VERSION once; returns { client, server } (may be partial). */
+  function readWindowVersion() {
+    try {
+      const v = window.$VERSION;
+      if (!v || typeof v !== "object") return {};
+      return {
+        client: typeof v.CLIENT === "string" && v.CLIENT ? v.CLIENT : null,
+        server: typeof v.SERVER === "string" && v.SERVER ? v.SERVER : null,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function getClientVersion() {
+    if (cachedClientVersion) return cachedClientVersion;
+    const fromWin = readWindowVersion().client;
+    if (fromWin) {
+      cachedClientVersion = fromWin;
+      return cachedClientVersion;
+    }
+    // Late fallback: scrape inline boot script `CLIENT: 'x.y.z'`
+    try {
+      const head = (document.head && document.head.innerHTML) || "";
+      const m = head.match(/CLIENT\s*:\s*['"]([\d.]+)['"]/);
+      if (m) {
+        cachedClientVersion = m[1];
+        return cachedClientVersion;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    cachedClientVersion = CLIENT_VERSION_FALLBACK;
+    return cachedClientVersion;
+  }
+
+  function getServerVersion() {
+    if (cachedServerVersion) return cachedServerVersion;
+    const fromWin = readWindowVersion().server;
+    if (fromWin) {
+      cachedServerVersion = fromWin;
+      return cachedServerVersion;
+    }
+    try {
+      const head = (document.head && document.head.innerHTML) || "";
+      const m =
+        head.match(/SERVER\s*:\s*['"](v20\d{2}\.\d{2}\.\d{2}\.\d+)['"]/) ||
+        head.match(/\b(v20\d{2}\.\d{2}\.\d{2}\.\d+)\b/);
+      if (m) {
+        cachedServerVersion = m[1];
+        return cachedServerVersion;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    cachedServerVersion = SERVER_VERSION_FALLBACK;
+    return cachedServerVersion;
+  }
+
+  /** W3C traceparent: 00-<32 hex trace id>-<16 hex span id>-00 */
+  function makeTraceparent() {
+    const hex = (n) => {
+      const a = new Uint8Array(n);
+      (window.crypto || window.msCrypto).getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+    };
+    return `00-${hex(16)}-${hex(8)}-00`;
+  }
+
   function apiHeaders(isPost) {
     const h = {
+      accept: "application/json, text/plain, */*",
+      "client-version": getClientVersion(),
+      "server-version": getServerVersion(),
+      traceparent: makeTraceparent(),
       "x-requested-with": "XMLHttpRequest",
       "x-xsrf-token": getXsrfToken(),
     };
@@ -319,9 +412,12 @@
     if (!res.ok) throw new Error(`modifyVisible HTTP ${res.status}`);
     const data = await res.json();
     if (!(data.ok > 0)) {
-      const e = new Error(`modifyVisible ok=${data.ok} ${data.msg || ""}`.trim());
-      // ok<=0 with a rate/frequency message is rate-limiting; otherwise treat as risk too.
-      e.code = /频次|频繁|过快|limit|too many/i.test(data.msg || "") ? "RISK" : "RISK";
+      const msg = data.msg || "";
+      const e = new Error(`modifyVisible ok=${data.ok} ${msg}`.trim());
+      // ok<=0: rate-limit wording → long RISK pause; auth → stop; else short backoff.
+      if (/频次|频繁|过快|limit|too many/i.test(msg)) e.code = "RISK";
+      else if (data.ok === -100 || /login|登录/i.test(msg)) e.code = "AUTH";
+      else e.code = "API";
       throw e;
     }
     return data;
@@ -418,8 +514,14 @@
     });
   }
 
-  function byRecentN(blogs, { n }) {
-    return blogs.slice(0, n); // mymblog is already newest-first
+  /**
+   * "最近 N 条" must be enforced across the whole timeline, not per page.
+   * Per-page slice(0, n) would skip the tail of earlier pages when N spans
+   * multiple pages (or when many already-private items force further scanning).
+   * Identity here; runApiMode trims with remaining = n - hits.length.
+   */
+  function byRecentN(blogs) {
+    return blogs;
   }
 
   function applyFilter(blogs, cfg) {
@@ -474,7 +576,6 @@
     const stats = { success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
     let page = 1;
     let sinceId = null;
-    let recentHitCount = 0; // for "recent N" we count non-skipped hits
 
     onLog(
       dryRun
@@ -517,8 +618,19 @@
         break;
       }
 
-      const matched = applyFilter(list, filterCfg);
-      stats.scanned += list.length;
+      // Filter this page. For "recent N", take only what's still needed so the
+      // timeline stays contiguous across pages (no per-page slice that skips tails).
+      let matched = applyFilter(list, filterCfg);
+      if (filterCfg.type === "recent") {
+        const remaining = filterCfg.n - stats.hits.length;
+        if (remaining <= 0) break;
+        matched = matched.slice(0, remaining);
+        // Count only the prefix we actually walk — mymblog still returns ~20/page,
+        // but "已扫描" should not jump to 20 when the user only asked for N=10.
+        stats.scanned += matched.length;
+      } else {
+        stats.scanned += list.length;
+      }
       onProgress({ ...stats });
       await yieldToRender();
 
@@ -539,13 +651,16 @@
 
         if (isPrivate(blog)) {
           stats.skipped++;
-          onLog(`跳过 [${mid}] ${day} (已是仅自己可见)`, "muted");
+          // 已锁定的不刷屏：前 3 条 + 每 50 条打一次进度
+          if (stats.skipped <= 3 || stats.skipped % 50 === 0) {
+            onLog(`跳过已锁定 ${stats.skipped} 条（最近 [${mid}] ${day}）`, "muted");
+          }
           onProgress({ ...stats });
           continue;
         }
 
         if (dryRun) {
-          onLog(`命中 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
+          onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
           onProgress({ ...stats });
           continue;
         }
@@ -593,13 +708,10 @@
         await sleep(randomDelayMs(1.0), signal);
       }
 
-      // "recent N": stop once we have enough non-skipped hits.
-      if (filterCfg.type === "recent") {
-        recentHitCount = stats.hits.length - stats.skipped;
-        if (recentHitCount >= filterCfg.n) {
-          onLog(`已达「最近 ${filterCfg.n} 条」目标，停止扫描。`, "info");
-          break;
-        }
+      // "最近 N 条": stop once we have N timeline items (private ones count toward N).
+      if (filterCfg.type === "recent" && stats.hits.length >= filterCfg.n) {
+        onLog(`已达「最近 ${filterCfg.n} 条」目标，停止扫描。`, "info");
+        break;
       }
 
       sinceId = pageData.since_id;
@@ -613,7 +725,7 @@
     }
 
     onLog(
-      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 命中 ${stats.hits.length}` +
+      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${stats.hits.filter((h) => !h.isPrivate).length}` +
         (dryRun ? "（预览，未实际修改）" : ""),
       "summary"
     );
@@ -630,9 +742,13 @@
    * the `dryRun` flag only toggles the startup log line, kept for signature
    * parity with runApiMode.
    *
-   * Pagination (verified, see fetchSearchProfilePage + research notes): the
-   * endpoint ignores page/max_id/since_id, so we shrink `endtime` to the oldest
-   * item's created_at each iteration until empty or no new mids surface.
+   * Pagination (verified 2026-07-28 via live searchProfile):
+   *   - page/max_id/since_id are ignored; shrink `endtime` to walk older.
+   *   - Response includes `data.total` (server-side match count) — trust it to
+   *     stop when hits.length >= total, avoiding a wasteful second request that
+   *     only re-returns the boundary item (was inflating 已扫描: 15+1=16).
+   *   - Advance with `oldestEpoch - 1` so the boundary mid is not re-fetched.
+   *   - `已扫描` counts unique mids only (not raw list.length across slices).
    *
    * @param {object} opts
    * @param {string}  opts.uid
@@ -649,6 +765,7 @@
     const seenMids = new Set();
     let curEnd = endtime;
     let slice = 0;
+    let serverTotal = null; // data.total from first non-empty response
 
     onLog(
       `【预览模式】用 searchProfile 按时间服务端筛选（不会修改任何微博）...` +
@@ -691,13 +808,15 @@
         break;
       }
 
-      stats.scanned += list.length;
-      onProgress({ ...stats });
+      // Prefer server total (number or numeric string) so we can stop early.
+      if (serverTotal == null && pageData.total != null && pageData.total !== "") {
+        const t = Number(pageData.total);
+        if (Number.isFinite(t) && t >= 0) serverTotal = t;
+      }
+
       await yieldToRender();
 
-      // Process only mids not seen in a prior slice. Dedup is mandatory: when
-      // curEnd lands on an item whose created_at equals the boundary, that
-      // item reappears next slice and would loop forever without this guard.
+      // Process only mids not seen in a prior slice.
       let newCount = 0;
       let oldestEpoch = null;
       for (const blog of list) {
@@ -713,6 +832,7 @@
         if (seenMids.has(mid)) continue; // already collected in an earlier slice
         seenMids.add(mid);
         newCount++;
+        stats.scanned++; // unique mids only — do not count boundary re-fetches
 
         const day = toDayStr(t);
         const preview = {
@@ -726,30 +846,49 @@
 
         if (isPrivate(blog)) {
           stats.skipped++;
-          onLog(`跳过 [${mid}] ${day} (已是仅自己可见)`, "muted");
+          // 已锁定的不刷屏：前 3 条 + 每 50 条打一次进度
+          if (stats.skipped <= 3 || stats.skipped % 50 === 0) {
+            onLog(`跳过已锁定 ${stats.skipped} 条（最近 [${mid}] ${day}）`, "muted");
+          }
         } else {
-          onLog(`命中 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
+          onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
         }
         onProgress({ ...stats });
       }
 
       if (newCount === 0) {
-        // Every item this slice was already seen → curEnd didn't move past a
-        // real boundary (same-second collision). Stop to avoid an infinite loop.
+        // Every item this slice was already seen → stop (no progress).
         onLog(`本段无新微博（已全部覆盖），结束扫描。`, "info");
         break;
       }
 
-      if (oldestEpoch == null || oldestEpoch >= curEnd) {
-        // Couldn't find a strictly-older timestamp to advance to; stop.
+      // Server says we already have every match — skip the wasteful next slice
+      // that would only re-return the oldest boundary item.
+      if (serverTotal != null && stats.hits.length >= serverTotal) {
+        onLog(`已达服务端总数 ${serverTotal}，结束扫描。`, "info");
+        break;
+      }
+
+      if (oldestEpoch == null) {
         onLog(`无法继续推进时间游标，结束扫描。`, "info");
         break;
       }
-      curEnd = oldestEpoch;
+      // Exclusive of the oldest item we already have (was: curEnd = oldest →
+      // next response re-included that mid, inflating 已扫描 by 1).
+      const nextEnd = oldestEpoch - 1;
+      if (nextEnd >= curEnd) {
+        onLog(`无法继续推进时间游标，结束扫描。`, "info");
+        break;
+      }
+      if (starttime != null && nextEnd < starttime) {
+        onLog(`时间游标已低于起始时间，结束扫描。`, "info");
+        break;
+      }
+      curEnd = nextEnd;
     }
 
     onLog(
-      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 命中 ${stats.hits.length}` +
+      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${stats.hits.filter((h) => !h.isPrivate).length}` +
         "（预览，未实际修改）",
       "summary"
     );
@@ -794,6 +933,8 @@
           onLog(`处理中 [${mid}] 尝试 ${attempt}/${CONFIG.MAX_RETRY}`, "info");
           await modifyVisible(mid, signal);
           stats.success++;
+          // Mutate preview snapshot so a second「执行」won't re-lock the same mid.
+          item.isPrivate = true;
           onLog(`✓ 已锁定 [${mid}] ${day}`, "success");
           done = true;
           break;
@@ -887,9 +1028,15 @@
       uidHint: $("#wbl-uid"),
     };
 
-    // uid hint
-    const uid = getUid();
-    els.uidHint.textContent = uid ? `当前 UID: ${uid}` : "未识别 UID（请打开 /u/<你的uid>）";
+    // uid: re-read on each action (weibo is an SPA; path can change after inject)
+    function refreshUidHint() {
+      const uid = getUid();
+      els.uidHint.textContent = uid
+        ? `当前 UID: ${uid}`
+        : "未识别 UID（请打开 /u/<你的uid>）";
+      return uid;
+    }
+    refreshUidHint();
 
     // filter switching
     function currentFilterCfg() {
@@ -930,7 +1077,8 @@
     const beforeMonthsEl = $("#wbl-before-months");
     function refreshBeforeCutoff() {
       const m = parseInt(beforeMonthsEl.value, 10) || 1;
-      beforeCutoffEl.textContent = `（锁定 ${cutoffDayMonthsAgo(m)} 及更早）`;
+      // Strictly older than cutoff day (endtime = cutoff 00:00:00); not "及更早".
+      beforeCutoffEl.textContent = `（锁定早于 ${cutoffDayMonthsAgo(m)} 的微博）`;
     }
     beforeMonthsEl.addEventListener("change", refreshBeforeCutoff);
     refreshBeforeCutoff();
@@ -960,7 +1108,11 @@
       els.counts.skipped.textContent = stats.skipped;
       els.counts.failed.textContent = stats.failed;
       els.counts.scanned.textContent = stats.scanned;
-      els.counts.hits.textContent = stats.hits.length;
+      // 「待锁」= 命中且尚未仅自己可见（type!=1）。已锁定的只进「跳过」，不进此计数。
+      const lockable = Array.isArray(stats.hits)
+        ? stats.hits.filter((h) => !h.isPrivate).length
+        : 0;
+      els.counts.hits.textContent = lockable;
     }
 
     function setMode(mode) {
@@ -973,7 +1125,7 @@
       root.querySelectorAll("input, select").forEach((i) => (i.disabled = busy));
     }
 
-    function validateCfg(cfg) {
+    function validateCfg(cfg, uid) {
       if (!uid) return "未识别 UID，请打开 https://weibo.com/u/<你的uid> 页面后再用。";
       if (!getXsrfToken()) return "读取不到 XSRF-TOKEN，请确认已登录 weibo.com。";
       if (cfg.type === "date") {
@@ -987,6 +1139,8 @@
         if (cfg.endMid && !/^\d+$/.test(cfg.endMid)) return "结束 mid 应为纯数字";
         if (cfg.startMid && cfg.endMid && cmpMid(cfg.startMid, cfg.endMid) > 0)
           return "起始 mid 不能大于结束 mid";
+        if (!cfg.startMid && !cfg.endMid)
+          return "请至少填写起始 mid 或结束 mid（双空会扫全时间线）";
       }
       if (cfg.type === "before") {
         if (!(cfg.months >= 1)) return "时间预设的月数应大于 0";
@@ -996,8 +1150,9 @@
 
     // --- actions ---
     async function doPreview() {
+      const uid = refreshUidHint();
       const cfg = currentFilterCfg();
-      const err = validateCfg(cfg);
+      const err = validateCfg(cfg, uid);
       if (err) {
         log(err, "error");
         return;
@@ -1051,8 +1206,16 @@
           });
         }
         state.lastPreview = { hits: stats.hits, filterCfg: cfg, at: Date.now() };
-        log(`预览命中 ${stats.hits.length} 条（其中 ${stats.skipped} 条已是仅自己可见）`, "summary");
-        log(`点「执行」将直接锁定以上命中的微博（无需重新扫描）`, "info");
+        const lockable = stats.hits.filter((h) => !h.isPrivate).length;
+        log(
+          `预览完成 — 扫描 ${stats.scanned} · 待锁 ${lockable} · 已是仅自己可见 ${stats.skipped}`,
+          "summary"
+        );
+        if (lockable > 0) {
+          log(`点「执行」将锁定上述 ${lockable} 条（已锁定的会自动跳过）`, "info");
+        } else {
+          log(`没有需要锁定的微博。`, "info");
+        }
       } catch (e) {
         if (e.name === "AbortError") log("预览已停止", "warn");
         else if (e.code === "AUTH") log(`鉴权错误: ${e.message}（请重新登录）`, "error");
@@ -1063,8 +1226,9 @@
     }
 
     async function doRun() {
+      refreshUidHint(); // keep hint fresh; locking uses mids from lastPreview
       const cfg = currentFilterCfg();
-      const err = validateCfg(cfg);
+      const err = validateCfg(cfg, getUid());
       if (err) {
         log(err, "error");
         return;
@@ -1127,6 +1291,8 @@
     els.clearBtn.addEventListener("click", () => {
       els.log.innerHTML = "";
       setCounts({ success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] });
+      state.lastPreview = null; // drop cached mids so「执行」不能用旧预览
+      log("已清空日志与预览缓存，请重新预览后再执行。", "info");
     });
 
     // minimize / drag
@@ -1159,7 +1325,7 @@
 
     setMode("idle");
     log("面板已加载。默认 dry-run 预览，点「执行」会二次确认。", "info");
-    if (!uid) log("提示：当前页未识别到 UID，请打开 https://weibo.com/u/<你的uid>", "warn");
+    if (!getUid()) log("提示：当前页未识别到 UID，请打开 https://weibo.com/u/<你的uid>", "warn");
   }
 
   // ===========================================================================
@@ -1233,7 +1399,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.6.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.6.5</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -1291,7 +1457,7 @@
           <div class="wbl-count wbl-c-skipped"><b id="wbl-c-skipped">0</b><span>跳过</span></div>
           <div class="wbl-count wbl-c-failed"><b id="wbl-c-failed">0</b><span>失败</span></div>
           <div class="wbl-count"><b id="wbl-c-scanned">0</b><span>已扫描</span></div>
-          <div class="wbl-count wbl-c-hits"><b id="wbl-c-hits">0</b><span>命中</span></div>
+          <div class="wbl-count wbl-c-hits"><b id="wbl-c-hits">0</b><span>待锁</span></div>
         </div>
 
         <div class="wbl-log" id="wbl-log"></div>

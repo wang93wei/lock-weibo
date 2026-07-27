@@ -7,8 +7,8 @@
 ## 功能
 
 - **四种筛选**（单选）：
-  - 最近 N 条
-  - 时间预设：1 个月前 / 3 个月前 / 半年前 / 1 年前（截止日每次实时计算，动态锁定）
+  - 最近 N 条（按时间倒序连续扫描，含已锁定的也计入 N）
+  - 时间预设：1 个月前 / 3 个月前 / 半年前 / 1 年前（截止日每次实时计算；**严格早于** cutoff 当天，不含当天）
   - 发布日期范围（`起 ~ 止`，闭区间）
   - mid 数值范围
 - **滑动窗口限速**：任意 10s 内最多 N 次请求（默认 3，≈每 3.3s 一次），覆盖翻页与修改请求。面板可调，被风控过就调小。
@@ -34,9 +34,9 @@
 
 1. 浏览器登录 [weibo.com](https://weibo.com/)，打开自己的主页 `https://weibo.com/u/<你的uid>`
 2. 右上角出现「微博批量锁」面板
-3. 选筛选方式 → 点 **🔍 预览(dry-run)** 查看命中清单（不会改任何数据）
-4. 确认无误 → 点 **🔒 执行** → 弹窗二次确认 → 开始（直接用上一步预览到的微博，不再重新扫描）
-5. 过程中可随时点 **⏹ 停止**
+3. 选筛选方式 → 点 **预览(dry-run)** 查看命中清单（不会改任何数据）
+4. 确认无误 → 点 **执行** → 弹窗二次确认 → 开始（直接用上一步预览到的微博，不再重新扫描）
+5. 过程中可随时点 **停止**
 
 > 「执行」依赖「预览」的结果：必须先预览过才能执行；若改了筛选条件，需重新预览。
 >
@@ -58,10 +58,11 @@
 
 | 用途 | 接口 |
 |---|---|
-| 拉取微博列表 | `GET /ajax/statuses/mymblog?uid=&page=&feature=0` |
+| 列表（最近 N / mid） | `GET /ajax/statuses/mymblog?uid=&page=&feature=0`（`since_id` 分页） |
+| 列表（时间预设 / 日期范围） | `GET /ajax/statuses/searchProfile`（服务端按 `starttime`/`endtime` 筛选） |
 | 修改可见性 | `POST /ajax/statuses/modifyVisible`，body `ids=<mid>&visible=1` |
 
-可见性枚举（仅自己可见 = type 1）从微博前端 bundle 源码核验。详见 [`docs`](./.trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md)。
+可见性枚举（仅自己可见 = type 1）从微博前端 bundle 源码核验。详见 [接口核验记录](./.trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md)。
 
 ## 项目结构
 
@@ -75,6 +76,10 @@ scripts/weibo-batch-locker.user.js   # 脚本本体（自包含，无外部依�
 - 仅在 weibo.com PC 网页版生效（需保持登录态）
 - 单次 `mymblog` 每页固定返回约 20 条，无法调大
 - 不做批量删除；不做粉丝可见/好友圈可见（架构上可扩展，UI 未暴露）
+
+## 声明
+
+本脚本**仅供个人自用**，用于管理自己账号下的微博可见性。若涉及侵权或其它权益问题，请通过 GitHub Issues 及时联系作者，将尽快处理。
 
 ## License
 

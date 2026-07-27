@@ -22,35 +22,55 @@ Managed by Trellis. Edits outside this block are preserved; edits inside may be 
 
 # Project: lock-weibo
 
-Batch-set your own weibo posts to "仅自己可见" (private, `visible.type=1`). Ships as a **single Tampermonkey/Greasemonkey userscript** — there is no build step, bundler, package.json, test suite, or linter.
+Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** Tampermonkey userscript — no build, bundler, package.json, tests, or linter.
 
 ## Source map
 
-- `scripts/weibo-batch-locker.user.js` — the entire app (~980 lines, one IIFE, `"use strict"`). Internal layout, top to bottom:
-  - `CONFIG` constants (page size, rate-limit window, retry policy, `PRIVATE_TYPE: 1`) + `VISIBLE_TEXT` enum
-  - Auth helpers (`getUid`, `getXsrfToken`)
-  - Date / `mid` utilities + filters (`byDateRange`, `byMidRange`, `byBeforeMonths`, `byRecentN`, `applyFilter`)
-  - `createRateLimiter()` → one **global** `rateLimiter` instance shared by all requests
-  - API layer: `apiHeaders`, `fetchBlogPage` (list), `modifyVisible` (lock)
-  - `runApiMode` orchestration (dry-run, retry/backoff, abort)
-  - UI panel: `createPanel`, `BUILD_PANEL_HTML`, `boot`
-- `.trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md` — **the verified Weibo API contract. Read this before touching the API layer.**
+- `scripts/weibo-batch-locker.user.js` — entire app (~1500 lines, one IIFE, `"use strict"`). Top→bottom:
+  - `CONFIG` + `VISIBLE_TEXT`
+  - Auth / date / mid utils + filters
+  - Global `rateLimiter` (sliding window)
+  - API: `fetchBlogPage` (mymblog), `fetchSearchProfilePage`, `modifyVisible`
+  - Orchestration: `runApiMode` (mymblog path), `runApiModeSearchProfile` (date/before), `lockByIds` (execute from preview)
+  - Shadow DOM UI: `createPanel`, `BUILD_PANEL_HTML`, `boot`
+- `.trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md` — **verified API contract. Read before any API change.**
 
 ## Working on this repo
 
-- **No build/test commands.** "Verify" means: install the edited `.user.js` in Tampermonkey, open `weibo.com` while logged in, and exercise the panel. There is nothing to `npm run`.
-- **Never trust memory for Weibo endpoints.** These are undocumented internal AJAX APIs that drift. Before adding/changing any call, re-verify first-hand (DevTools Network capture or the platform's own JS bundle) and update `research/weibo-api-notes.md` with the date + source. See `.trellis/spec/guides/third-party-api-verification-guide.md`. Past drift already caused real bugs (endpoint renamed, `visible` reshaped from number to object, value-type number→string).
+- **No npm/build/test.** Verify = install `.user.js` in Tampermonkey → logged-in `weibo.com/u/<uid>` → exercise panel.
+- **Never trust memory for Weibo endpoints.** Undocumented internal AJAX; drift is real. Re-verify (DevTools / weibo-pro-next bundle) and update `weibo-api-notes.md` with date + source. Guide: `.trellis/spec/guides/third-party-api-verification-guide.md`.
+- **Branch:** `main`. Only runtime artifact is the `.user.js`.
 
 ## Hard-won invariants (do not regress)
 
-- **Rate limiting is a sliding window, not fixed delays.** `CONFIG.RATE_WINDOW_MS` / `RATE_MAX` (~3 req / 10s) throttle *both* `mymblog` pagination and `modifyVisible` via the single global `rateLimiter.acquire(signal)`. Fixed inter-request delays triggered Weibo risk control (HTTP 414 / "频次过快") — see commits `b2c4ecb`, `40ea1be`. Any new network call must go through `rateLimiter.acquire()` first.
-- **Value-type gotcha:** in `modifyVisible`, `visible` is the **string** `"1"` in the form body; in the `mymblog` response it is the **object** `{ type, list_id }`. `isPrivate(blog)` checks `blog.visible.type === 1`, not `blog.visible === 1`.
-- **Auth headers:** `x-xsrf-token` (read from the `XSRF-TOKEN` cookie via `document.cookie`) + `x-requested-with: XMLHttpRequest`. POST bodies are `application/x-www-form-urlencoded`.
-- **Safety defaults:** dry-run is the default; real execution requires a second `confirm()`. Every async op threads an `AbortController` signal so the Stop button works mid-scan. Preserve both when editing `runApiMode` / `doRun`.
-- **Version sync:** when bumping the version, update **both** `// @version` in the userscript header **and** the `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.4.0`).
+### Rate limit & risk control
+- **Sliding window, not fixed delays.** `CONFIG.RATE_WINDOW_MS` / `RATE_MAX` (~3 req / 10s) throttle **all** of mymblog / searchProfile / modifyVisible via one global `rateLimiter.acquire(signal)`. Fixed delays triggered HTTP 414 /「频次过快」(commits `b2c4ecb`, `40ea1be`). New network calls must `acquire()` first.
+- RISK → pause `RATE_LIMITED_WAIT_MS` (30s); other API errors → exponential backoff; AUTH → abort. Do not collapse RISK and non-RISK into the same branch.
+
+### API contracts
+| Call | Path | Notes |
+|---|---|---|
+| List (recent/mid) | `GET /ajax/statuses/mymblog` | page + `since_id`; ~20/page fixed |
+| List (date/before) | `GET /ajax/statuses/searchProfile` | server-side time filter; **`page`/`max_id`/`since_id` ignored** — paginate by shrinking `endtime` to oldest item's `created_at` |
+| Lock | `POST /ajax/statuses/modifyVisible` | form body `ids=<mid>&visible=1` (`visible` is **string** `"1"`) |
+
+- **Headers:** `x-xsrf-token` (cookie `XSRF-TOKEN`), `x-requested-with`, plus mirror weibo-pro-next: `client-version` / `server-version` (from `window.$VERSION`) / `traceparent`. `credentials:"include"`. Do **not** set forbidden headers (cookie/UA/referer).
+- **Response `visible`:** object `{ type, list_id }`, not a number. `isPrivate` uses `Number(blog.visible.type) === 1` (number **or** string `"1"`).
+
+### Filter / flow semantics
+- **最近 N 条:** newest-first continuous scan across pages; stop when hits (including already-private skips) reach N. **Never** per-page `slice(0, n)`.
+- **时间预设 (before):** strictly **before** cutoff day (exclude cutoff date). UI:「早于 YYYY-MM-DD」. `searchProfile` `endtime` = cutoff 00:00:00.
+- **日期范围:** closed interval on calendar days; uses searchProfile.
+- **Preview → execute:** execute reuses `lastPreview.hits` via `lockByIds` (no second scan). Changing filter invalidates preview. Successful locks mutate `item.isPrivate = true`. Clear log also clears `lastPreview` + counters.
+- **UID:** weibo is SPA — re-call `getUid()` on preview/run (`/u/<id>` or `/profile/<id>`), don't cache only at panel create.
+
+### Safety & UX
+- Dry-run default; real run needs second `confirm()`. Thread `AbortController` through every async path (Stop mid-scan).
+- Tight await-loops must `await yieldToRender()` or the panel freezes while requests still fire.
+- **Version sync:** bump **both** `// @version` header **and** `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.6.5`).
 
 ## Conventions
 
-- **Commits:** Chinese conventional-commits style — `feat:` / `fix:` / `chore:` / `docs:` followed by a Chinese summary, e.g. `fix: 修复批量扫描触发微博风控（414/频次过快）`.
-- **Code comments / UI strings:** bilingual is fine — Chinese for user-facing log/panel text and rationale comments, English for symbol names and structure. Match the surrounding style.
-- **Branch:** work happens on `main`. The repo's only runtime artifact is the `.user.js` file itself.
+- **Commits:** Chinese conventional-commits — `feat:` / `fix:` / `chore:` / `docs:` + 中文摘要, e.g. `fix: 修复批量扫描触发微博风控（414/频次过快）`.
+- **Comments / UI:** 中文 for user-facing log/panel + rationale; English for symbols. Match surrounding style. Prefer small logs when debugging async flow.
+- **License:** Apache-2.0 (not MIT).
