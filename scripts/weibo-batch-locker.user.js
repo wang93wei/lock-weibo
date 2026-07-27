@@ -4,6 +4,7 @@
 // @version      0.6.5
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
+// @supportURL   https://github.com/wang93wei/lock-weibo/issues
 // @match        https://weibo.com/*
 // @run-at       document-idle
 // @grant        none
