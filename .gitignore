@@ -1,0 +1,23 @@
+# ---- 操作系统垃圾 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
+*.bak
+
+# ---- 依赖与构建产物（本项目无构建，仅作兜底） ----
+node_modules/
+dist/
+
+# ---- AI 工具本地个人配置（团队共享配置已入库，勿忽略） ----
+.claude/settings.local.json
