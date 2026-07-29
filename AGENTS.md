@@ -33,7 +33,7 @@ Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** 
   - API: `fetchBlogPage` (mymblog), `fetchSearchProfilePage`, `modifyVisible`
   - Orchestration: `runApiMode` (mymblog path), `runApiModeSearchProfile` (date/before), `lockByIds` (execute from preview)
   - Shadow DOM UI: `createPanel`, `BUILD_PANEL_HTML`, `boot`
-- `.trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md` — **verified API contract. Read before any API change.**
+- `.trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md` — **verified API contract. Read before any API change.**
 
 ## Working on this repo
 
@@ -62,12 +62,12 @@ Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** 
 - **时间预设 (before):** strictly **before** cutoff day (exclude cutoff date). UI:「早于 YYYY-MM-DD」. `searchProfile` `endtime` = cutoff 00:00:00.
 - **日期范围:** closed interval on calendar days; uses searchProfile.
 - **Preview → execute:** execute reuses `lastPreview.hits` via `lockByIds` (no second scan). Changing filter invalidates preview. Successful locks mutate `item.isPrivate = true`. Clear log also clears `lastPreview` + counters.
-- **UID:** weibo is SPA — re-call `getUid()` on preview/run (`/u/<id>` or `/profile/<id>`), don't cache only at panel create.
+- **UID:** prefer login `$CONFIG.uid` / `$CONFIG.user.idstr` (own posts only); URL `/u|profile/<id>` is fallback. Re-call on preview/run; SPA `pushState`/`replaceState`/`popstate` refreshes the panel hint (don't cache only at create).
 
 ### Safety & UX
 - Dry-run default; real run needs second `confirm()`. Thread `AbortController` through every async path (Stop mid-scan).
 - Tight await-loops must `await yieldToRender()` or the panel freezes while requests still fire.
-- **Version sync:** bump **both** `// @version` header **and** `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.6.5`).
+- **Version sync:** bump **both** `// @version` header **and** `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.6.6`).
 
 ## Conventions
 
