@@ -74,7 +74,7 @@ Headers: x-xsrf-token (from document.cookie XSRF-TOKEN)
 1 = 仅自己可见   ← verified from bundle menu builder + posting selector
 ```
 
-This is exactly what `.trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md` is.
+This is exactly what `.trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md` is.
 
 ---
 

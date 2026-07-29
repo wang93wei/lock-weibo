@@ -62,7 +62,7 @@
 | 列表（时间预设 / 日期范围） | `GET /ajax/statuses/searchProfile`（服务端按 `starttime`/`endtime` 筛选） |
 | 修改可见性 | `POST /ajax/statuses/modifyVisible`，body `ids=<mid>&visible=1` |
 
-可见性枚举（仅自己可见 = type 1）从微博前端 bundle 源码核验。详见 [接口核验记录](./.trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md)。
+可见性枚举（仅自己可见 = type 1）从微博前端 bundle 源码核验。详见 [接口核验记录](./.trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md)。
 
 ## 项目结构
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.6.5
+// @version      0.6.6
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
@@ -15,7 +15,7 @@
 
 /*
  * Interface contracts (verified first-hand 2026-07-27, see
- * .trellis/tasks/07-27-weibo-batch-locker/research/weibo-api-notes.md):
+ * .trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md):
  *
  *   List:  GET /ajax/statuses/mymblog?uid=&page=&feature=0[&since_id=]
  *          -> { ok:1, data:{ list:[{id, mid, visible:{type,list_id}, created_at, text_raw}], total, since_id } }
@@ -65,13 +65,45 @@
   // Utils
   // ===========================================================================
 
-  /** Read the logged-in user's uid from the current URL. */
+  /**
+   * Logged-in user's uid. Prefer weibo globals ($CONFIG) so homepage / SPA
+   * routes work; fall back to /u/<id> or /profile/<id> in the URL.
+   * This tool only locks own posts — always the login uid, not "page owner".
+   */
   function getUid() {
+    const cfg = window.$CONFIG;
+    if (cfg) {
+      const fromCfg = cfg.uid ?? cfg.user?.idstr ?? cfg.user?.id;
+      if (fromCfg != null && /^\d+$/.test(String(fromCfg))) return String(fromCfg);
+    }
     const m = window.location.pathname.match(/\/u\/(\d+)/);
     if (m) return m[1];
     const m2 = window.location.pathname.match(/\/profile\/(\d+)/);
     if (m2) return m2[1];
     return null;
+  }
+
+  /** SPA route change: pushState / replaceState / popstate. */
+  function onSpaNavigate(cb) {
+    const fire = () => {
+      try {
+        cb();
+      } catch (e) {
+        console.warn("[wbl] spa navigate hook", e);
+      }
+    };
+    const wrap = (type) => {
+      const orig = history[type];
+      if (typeof orig !== "function") return;
+      history[type] = function (...args) {
+        const ret = orig.apply(this, args);
+        fire();
+        return ret;
+      };
+    };
+    wrap("pushState");
+    wrap("replaceState");
+    window.addEventListener("popstate", fire);
   }
 
   /** Extract XSRF-TOKEN from document.cookie (verified non-HttpOnly). */
@@ -1029,15 +1061,23 @@
       uidHint: $("#wbl-uid"),
     };
 
-    // uid: re-read on each action (weibo is an SPA; path can change after inject)
-    function refreshUidHint() {
+    // uid: re-read on each action + SPA route change (weibo is SPA)
+    let lastUidHint = undefined; // undefined = never set; null = shown as unknown
+    function refreshUidHint(opts) {
+      const quiet = opts && opts.quiet;
       const uid = getUid();
       els.uidHint.textContent = uid
         ? `当前 UID: ${uid}`
-        : "未识别 UID（请打开 /u/<你的uid>）";
+        : "未识别 UID（请确认已登录，或打开 /u/<你的uid>）";
+      // Log only on transition unknown → known (avoid SPA spam)
+      if (!quiet && uid && lastUidHint !== uid && (lastUidHint === null || lastUidHint === undefined)) {
+        if (lastUidHint === null) log(`已识别 UID: ${uid}`, "info");
+      }
+      lastUidHint = uid;
       return uid;
     }
-    refreshUidHint();
+    refreshUidHint({ quiet: true });
+    onSpaNavigate(() => refreshUidHint());
 
     // filter switching
     function currentFilterCfg() {
@@ -1127,7 +1167,7 @@
     }
 
     function validateCfg(cfg, uid) {
-      if (!uid) return "未识别 UID，请打开 https://weibo.com/u/<你的uid> 页面后再用。";
+      if (!uid) return "未识别 UID，请确认已登录 weibo.com（或打开 /u/<你的uid> 后再试）。";
       if (!getXsrfToken()) return "读取不到 XSRF-TOKEN，请确认已登录 weibo.com。";
       if (cfg.type === "date") {
         const dRe = /^\d{4}-\d{2}-\d{2}$/;
@@ -1326,7 +1366,9 @@
 
     setMode("idle");
     log("面板已加载。默认 dry-run 预览，点「执行」会二次确认。", "info");
-    if (!getUid()) log("提示：当前页未识别到 UID，请打开 https://weibo.com/u/<你的uid>", "warn");
+    const bootUid = getUid();
+    if (bootUid) log(`当前 UID: ${bootUid}`, "info");
+    else log("提示：未识别到 UID，请确认已登录，或打开 https://weibo.com/u/<你的uid>", "warn");
   }
 
   // ===========================================================================
@@ -1400,7 +1442,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.6.5</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.6.6</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">

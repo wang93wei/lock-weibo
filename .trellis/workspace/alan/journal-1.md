@@ -26,3 +26,21 @@
 ### Status
 
 [OK] **Completed**
+
+---
+
+## Session 2: 修复 SPA 路由后 UID 未刷新
+
+**Date**: 2026-07-29
+**Task**: 07-29-uid-spa-refresh
+**Branch**: `main`
+
+### Summary
+
+- 归档遗留任务 `07-27-weibo-batch-locker`、`00-bootstrap-guidelines`
+- `getUid()` 优先 `$CONFIG.uid`；`onSpaNavigate` 刷新面板 UID
+- v0.6.6；AGENTS / frontend quality-guidelines / API 笔记路径同步
+
+### Status
+
+[OK] **Completed**
