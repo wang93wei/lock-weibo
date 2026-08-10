@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.6.6
+// @version      0.6.7
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
@@ -932,32 +932,37 @@
    * Lock a list of weibos by mid, reusing the mids gathered during preview
    * (avoids a second pagination sweep — halves request count + rate-limit exposure).
    *
-   * NOTE: items already marked isPrivate in the preview snapshot are skipped
-   * silently (the per-item "跳过" log was already emitted during preview — logging
-   * it again here just floods the panel). isPrivate here is the PREVIEW value,
-   * not re-fetched at run time; if you change a post's visibility manually
-   * between preview and run, that change is NOT re-checked.
+   * Already-private items (preview snapshot) are bulk-counted into `skipped`
+   * once at start — not walked one-by-one. Per-item "跳过" logs were already
+   * emitted during preview; re-walking thousands of skips with yieldToRender
+   * made "完成" hang long after real locks finished.
+   *
+   * isPrivate is the PREVIEW value, not re-fetched at run time; if you change a
+   * post's visibility manually between preview and run, that is NOT re-checked.
    *
    * @param {Array<{mid:string, isPrivate:boolean, date?:string}>} hits
    */
   async function lockByIds(hits, { onLog, onProgress, signal }) {
     const stats = { success: 0, skipped: 0, failed: 0, scanned: hits.length, hits };
-    onLog(`— 执行开始（真实修改），共 ${hits.length} 条 —`, "info");
-
+    // 已锁定的只计总数，不进逐条循环（避免千级跳过仍 rAF + onProgress 拖尾）
+    const toLock = [];
     for (const item of hits) {
+      if (item.isPrivate) stats.skipped++;
+      else toLock.push(item);
+    }
+    onLog(
+      `— 执行开始（真实修改），待锁 ${toLock.length} 条` +
+        (stats.skipped ? `，已锁定跳过 ${stats.skipped} 条` : "") +
+        ` —`,
+      "info"
+    );
+    onProgress({ ...stats });
+
+    for (const item of toLock) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
       await yieldToRender(); // let the browser paint log/counters
       const mid = String(item.mid);
       const day = item.date || "";
-
-      if (item.isPrivate) {
-        // 预览阶段已为「已是仅自己可见」逐条打过日志，执行阶段静默跳过即可，
-        // 避免把同样的"跳过"日志再刷一遍（仅累加 skipped 计数，最终 summary 汇总）。
-        // 注意：此处的 isPrivate 是预览快照值，并非执行时重新拉取的最新状态。
-        stats.skipped++;
-        onProgress({ ...stats });
-        continue;
-      }
 
       let done = false;
       for (let attempt = 1; attempt <= CONFIG.MAX_RETRY; attempt++) {
@@ -1442,7 +1447,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.6.6</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.6.7</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
