@@ -260,7 +260,62 @@ headers['server-version'] = window.$VERSION.SERVER
 
 不必模拟 `/ajax/log/action` 埋点请求（那是前端打点，不是业务鉴权依赖）。
 
-## 8. 参考资料
+## 8. 快转条目与 modifyVisible 失败契约（2026-08-12 实测）
+
+来源：登录态浏览器 DevTools 对 `mymblog` 响应、微博菜单及
+`modifyVisible` 失败请求的一手抓包（账号、mid 已脱敏）。
+
+`mymblog` 会把“快转”表示成原作者的顶层微博，而不是当前账号拥有的普通转发：
+
+```jsonc
+{
+  "mid": "<原微博 mid>",
+  "user": { "idstr": "<原作者 uid>" },
+  "ori_mid": "<当前账号的快转记录 mid>",
+  "ori_uid": "<当前登录 uid>",
+  "can_edit": false,
+  "share_repost_type": 0,
+  "mblog_menus_new": [
+    { "type": "mblog_menus_cancel_quick_forward", "name": "取消快转" }
+  ],
+  // 无 retweeted_status
+}
+```
+
+- 网页菜单只提供“取消快转”，不提供“转换为仅自己可见”。
+- 对顶层原微博 mid 调用 `POST /ajax/statuses/modifyVisible` 返回：
+  HTTP 400，`{"ok":0,"message":"not your own weibo!"}`。
+- 普通转发不同：顶层 `user.idstr` 是当前 UID，并存在 `retweeted_status`，仍属于可修改范围。
+- 脚本应优先用 `mblog_menus_cancel_quick_forward` 识别快转；菜单字段缺失时，可用
+  `ori_uid === 当前 UID`、顶层作者不是当前 UID、且无 `retweeted_status` 的组合兜底。
+- `not your own weibo` 是确定性业务拒绝，应立即跳过，不得指数退避重试。
+
+## 9. 取消快转接口 destroy（2026-08-12 官方 bundle 核验）
+
+来源：2026-08-12 登录态 `weibo.com` 当前加载的官方 `weibo-pro-next` bundle，搜索
+`mblog_menus_cancel_quick_forward` 并沿菜单处理函数追踪到实际请求调用。该调用把快转条目的
+`ori_mid` 传给删除接口；不是页面展示的原微博 `mid`。
+
+**请求**
+
+```http
+POST https://weibo.com/ajax/statuses/destroy
+Content-Type: application/json;charset=UTF-8
+X-XSRF-TOKEN: <XSRF-TOKEN cookie>
+X-Requested-With: XMLHttpRequest
+
+{"id":"<ori_mid>"}
+```
+
+- `id` 必须是快转关系记录 `ori_mid`；使用顶层原微博 `mid` 会指向错误实体。
+- 与其他业务请求相同，携带 `client-version`、`server-version`、`traceparent`，并通过
+  `credentials:"include"` 使用登录 Cookie。
+- 成功以 HTTP 2xx 且响应 `ok > 0` 判定。
+- HTTP 401/403 或登录文案归类 AUTH 并终止；414/429 或频控文案归类 RISK 并等待；
+  网络错误/5xx 可指数退避；其他 4xx 和 `ok <= 0` 是确定性业务拒绝，不盲目重试。
+- 生产侧仍需按人工清单小范围实测一次：取消一条快转并核对 Network 载荷与页面结果。
+
+## 10. 参考资料
 
 - 微博客服「微博可见性变更功能相关问题」https://kefu.weibo.com/faqdetail?id=21092
 - 第三方实现（部分描述与现网不符，仅供对照）https://github.com/ByteRax/WeiBoHideTool
