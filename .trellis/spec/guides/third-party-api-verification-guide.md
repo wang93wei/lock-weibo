@@ -47,6 +47,8 @@ Every one of these was a **real** finding during the weibo batch-locker task (20
 - [ ] Response success/failure shape verified (`ok` field? status code? nested object?).
 - [ ] Auth mechanism verified (cookie name, header name like `x-xsrf-token`, whether the cookie is HttpOnly).
 - [ ] Enum values verified against the platform's own code where possible.
+- [ ] **Ownership/capability verified per item shape** — appearing in a user's feed/profile does not prove the returned top-level entity is owned or mutable by that user. Compare owner IDs and inspect the official action menu for derived entries such as quick reposts.
+- [ ] **Non-2xx response bodies captured and retryability classified** — parse `message` / `msg` / `error` before deciding to retry. Deterministic business refusals (ownership, validation, unsupported action) must not use transient-error backoff.
 - [ ] Record findings to a `research/<topic>.md` file with the verification date and source URL, so the next session doesn't re-derive (or mis-remember) it.
 
 ---
@@ -84,6 +86,8 @@ This is exactly what `.trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/re
 - ❌ Copy-pasting a call from a 3-year-old Stack Overflow answer.
 - ❌ Trusting a third-party scraper repo's parameter names without reading the platform's own code.
 - ❌ Writing the whole feature, then discovering at integration time that the endpoint 404s.
+- ❌ Treating every item returned by “my profile/feed” as an owned, mutable entity without checking its owner and available official actions.
+- ❌ Throwing on `!response.ok` before reading the response body, then blindly retrying every 4xx as though it were transient.
 
 ---
 
