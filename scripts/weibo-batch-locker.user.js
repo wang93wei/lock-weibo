@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.6.7
-// @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
+// @version      0.6.9
+// @description  在 weibo.com 登录态下按条件批量将自己的微博设为「仅自己可见」，并可选取消筛选范围内的快转。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
 // @match        https://weibo.com/*
@@ -25,6 +25,10 @@
  *          Headers: x-xsrf-token (from document.cookie XSRF-TOKEN), x-requested-with
  *          -> { ok:>0, statuses:[...] }
  *
+ *   Cancel quick repost: POST /ajax/statuses/destroy
+ *          Body (JSON): { id: <ori_mid> }   (never the displayed original mid)
+ *          -> { ok:>0, ... }
+ *
  *   Visibility enum (from weibo-pro-next bundle):
  *     0=公开 1=仅自己可见 6=好友圈(list) 9=受限 10=粉丝 3=付费会员
  *     Only "仅自己可见" (1) is used here.
@@ -38,7 +42,7 @@
   // ===========================================================================
   const CONFIG = {
     PAGE_SIZE: 20, // mymblog returns ~20 per page
-    // Sliding-window rate limiter (global, covers both mymblog + modifyVisible).
+    // Sliding-window rate limiter (global, covers all list + mutation calls).
     // Allows at most RATE_MAX requests within any RATE_WINDOW_MS window.
     // Default ~3 req / 10s ≈ one request every ~3.3s on average.
     RATE_WINDOW_MS: 10000,
@@ -184,6 +188,82 @@
    *  Coerces type so both number 1 and string "1" count (API drift has done both). */
   function isPrivate(blog) {
     return Boolean(blog && blog.visible && Number(blog.visible.type) === CONFIG.PRIVATE_TYPE);
+  }
+
+  /**
+   * True for「快转」feed entries. mymblog represents a quick repost as the
+   * original author's status plus an ori_uid pointing at the logged-in user;
+   * it is not an owned status and its menu only offers「取消快转」.
+   *
+   * Prefer the official menu marker. The ownership-shape fallback covers
+   * searchProfile / future list variants that omit mblog_menus_new.
+   */
+  function isQuickRepost(blog, uid) {
+    if (!blog) return false;
+    const menus = Array.isArray(blog.mblog_menus_new) ? blog.mblog_menus_new : [];
+    if (menus.some((menu) => menu && menu.type === "mblog_menus_cancel_quick_forward")) return true;
+
+    const ownerUid = blog.user && (blog.user.idstr ?? blog.user.id);
+    return Boolean(
+      uid &&
+      blog.ori_uid != null &&
+      String(blog.ori_uid) === String(uid) &&
+      ownerUid != null &&
+      String(ownerUid) !== String(uid) &&
+      !blog.retweeted_status
+    );
+  }
+
+  /** Normalize one API item into the only action model consumed by UI/execution. */
+  function makePreviewItem(blog, uid, cancelQuickReposts) {
+    const mid = String(blog.mid || blog.id);
+    const quickRepost = isQuickRepost(blog, uid);
+    const item = {
+      mid,
+      actionId: mid,
+      action: "lock",
+      date: toDayStr(parseWeiboDate(blog.created_at)),
+      visible: visibleText(blog),
+      isPrivate: isPrivate(blog),
+      completed: false,
+      skipReason: "",
+      text: (blog.text_raw || "").slice(0, 40),
+    };
+
+    if (quickRepost) {
+      item.isPrivate = false; // visible belongs to the original status, not this repost relation.
+      if (!cancelQuickReposts) {
+        item.action = "skip";
+        item.skipReason = "quickRepostDisabled";
+      } else if (blog.ori_mid != null && String(blog.ori_mid).trim()) {
+        item.action = "cancelQuickRepost";
+        item.actionId = String(blog.ori_mid);
+      } else {
+        item.action = "skip";
+        item.skipReason = "missingOriMid";
+      }
+    } else if (item.isPrivate) {
+      item.action = "skip";
+      item.skipReason = "alreadyPrivate";
+    }
+    return item;
+  }
+
+  /** A preview item is an unfinished lock action. */
+  function isPreviewLockable(item) {
+    return Boolean(item && item.action === "lock" && !item.completed);
+  }
+
+  function isPreviewCancelable(item) {
+    return Boolean(item && item.action === "cancelQuickRepost" && !item.completed);
+  }
+
+  function countLockable(hits) {
+    return Array.isArray(hits) ? hits.filter(isPreviewLockable).length : 0;
+  }
+
+  function countCancelable(hits) {
+    return Array.isArray(hits) ? hits.filter(isPreviewCancelable).length : 0;
   }
 
   function visibleText(blog) {
@@ -369,7 +449,7 @@
     return `00-${hex(16)}-${hex(8)}-00`;
   }
 
-  function apiHeaders(isPost) {
+  function apiHeaders(isPost, contentType) {
     const h = {
       accept: "application/json, text/plain, */*",
       "client-version": getClientVersion(),
@@ -378,8 +458,41 @@
       "x-requested-with": "XMLHttpRequest",
       "x-xsrf-token": getXsrfToken(),
     };
-    if (isPost) h["content-type"] = "application/x-www-form-urlencoded";
+    if (isPost) h["content-type"] = contentType || "application/x-www-form-urlencoded";
     return h;
+  }
+
+  async function readApiBody(res) {
+    const raw = await res.text();
+    let data = null;
+    if (raw) {
+      try {
+        data = JSON.parse(raw);
+      } catch (_) {
+        // Keep raw text so non-JSON gateway responses remain diagnosable.
+      }
+    }
+    return {
+      raw,
+      data,
+      message: String((data && (data.message || data.msg || data.error)) || raw || "").trim(),
+    };
+  }
+
+  /** Classify mutation failures so only network/5xx and RISK are retried. */
+  function mutationError(name, res, body, opts) {
+    const msg = body.message;
+    const ok = body.data && body.data.ok;
+    let code = "BUSINESS";
+    if (res.status === 401 || res.status === 403 || ok === -100 || /login|登录/i.test(msg)) code = "AUTH";
+    else if (res.status === 414 || res.status === 429 || /频次|频繁|过快|limit|too many/i.test(msg)) code = "RISK";
+    else if (opts && opts.detectNotOwn && /not your own weibo/i.test(msg)) code = "NOT_OWN";
+    else if (res.status >= 500) code = "TRANSIENT";
+
+    const statusPart = res.ok ? `ok=${ok ?? "?"}` : `HTTP ${res.status}`;
+    const e = new Error(`${name} ${statusPart}${msg ? `: ${msg}` : ""}`);
+    e.code = code;
+    return e;
   }
 
   /** Fetch one page of the user's own weibo timeline. Returns data.data. */
@@ -432,28 +545,30 @@
       credentials: "include",
       signal,
     });
-    if (res.status === 403) {
-      const e = new Error("Cookie 已过期或未登录 (HTTP 403)");
-      e.code = "AUTH";
-      throw e;
+    // Always consume the body first: Weibo puts actionable business reasons in
+    // JSON even for HTTP 4xx (for example "not your own weibo!").
+    const parsed = await readApiBody(res);
+    if (!res.ok || !parsed.data || !(parsed.data.ok > 0)) {
+      throw mutationError("modifyVisible", res, parsed, { detectNotOwn: true });
     }
-    if (res.status === 414 || res.status === 429) {
-      const e = new Error(`访问频次过快，被微博限流 (HTTP ${res.status})`);
-      e.code = "RISK";
-      throw e;
+    return parsed.data;
+  }
+
+  /** Cancel one quick-repost relation. `oriMid` is the relation id, not original mid. */
+  async function destroyQuickRepost(oriMid, signal) {
+    await rateLimiter.acquire(signal); // same global sliding-window throttle
+    const res = await fetch("https://weibo.com/ajax/statuses/destroy", {
+      method: "POST",
+      headers: apiHeaders(true, "application/json;charset=UTF-8"),
+      body: JSON.stringify({ id: String(oriMid) }),
+      credentials: "include",
+      signal,
+    });
+    const parsed = await readApiBody(res);
+    if (!res.ok || !parsed.data || !(parsed.data.ok > 0)) {
+      throw mutationError("destroy", res, parsed);
     }
-    if (!res.ok) throw new Error(`modifyVisible HTTP ${res.status}`);
-    const data = await res.json();
-    if (!(data.ok > 0)) {
-      const msg = data.msg || "";
-      const e = new Error(`modifyVisible ok=${data.ok} ${msg}`.trim());
-      // ok<=0: rate-limit wording → long RISK pause; auth → stop; else short backoff.
-      if (/频次|频繁|过快|limit|too many/i.test(msg)) e.code = "RISK";
-      else if (data.ok === -100 || /login|登录/i.test(msg)) e.code = "AUTH";
-      else e.code = "API";
-      throw e;
-    }
-    return data;
+    return parsed.data;
   }
 
   /**
@@ -576,6 +691,7 @@
   /** Structural equality of two filter configs (used to guard run-after-preview). */
   function sameFilterCfg(a, b) {
     if (!a || !b || a.type !== b.type) return false;
+    if (Boolean(a.cancelQuickReposts) !== Boolean(b.cancelQuickReposts)) return false;
     switch (a.type) {
       case "date":
         return (a.start || "") === (b.start || "") && (a.end || "") === (b.end || "");
@@ -606,7 +722,8 @@
    */
   async function runApiMode(opts) {
     const { uid, filterCfg, dryRun, onLog, onProgress, signal } = opts;
-    const stats = { success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
+    const stats = { success: 0, lockedSuccess: 0, cancelledSuccess: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
+    let privateSkipped = 0;
     let page = 1;
     let sinceId = null;
 
@@ -671,29 +788,41 @@
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         await yieldToRender(); // let the browser paint log/counters
 
-        const mid = String(blog.mid || blog.id);
-        const day = toDayStr(parseWeiboDate(blog.created_at));
-        const preview = {
-          mid,
-          date: day,
-          visible: visibleText(blog),
-          isPrivate: isPrivate(blog),
-          text: (blog.text_raw || "").slice(0, 40),
-        };
+        const preview = makePreviewItem(blog, uid, Boolean(filterCfg.cancelQuickReposts));
+        const { mid, date: day } = preview;
         stats.hits.push(preview);
 
-        if (isPrivate(blog)) {
+        if (preview.skipReason === "alreadyPrivate") {
           stats.skipped++;
+          privateSkipped++;
           // 已锁定的不刷屏：前 3 条 + 每 50 条打一次进度
-          if (stats.skipped <= 3 || stats.skipped % 50 === 0) {
-            onLog(`跳过已锁定 ${stats.skipped} 条（最近 [${mid}] ${day}）`, "muted");
+          if (privateSkipped <= 3 || privateSkipped % 50 === 0) {
+            onLog(`跳过已锁定 ${privateSkipped} 条（最近 [${mid}] ${day}）`, "muted");
           }
           onProgress({ ...stats });
           continue;
         }
 
+        if (preview.skipReason === "quickRepostDisabled") {
+          stats.skipped++;
+          onLog(`跳过快转 [${mid}] ${day}（未启用“同时取消快转”）`, "muted");
+          onProgress({ ...stats });
+          continue;
+        }
+
+        if (preview.skipReason === "missingOriMid") {
+          stats.skipped++;
+          onLog(`跳过快转 [${mid}] ${day}（缺少 ori_mid，无法安全取消）`, "warn");
+          onProgress({ ...stats });
+          continue;
+        }
+
         if (dryRun) {
-          onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
+          if (preview.action === "cancelQuickRepost") {
+            onLog(`待取消快转 [${mid}] ${day} ${(blog.text_raw || "").slice(0, 20)}`, "warn");
+          } else {
+            onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
+          }
           onProgress({ ...stats });
           continue;
         }
@@ -704,9 +833,18 @@
           if (signal.aborted) throw new DOMException("Aborted", "AbortError");
           try {
             onLog(`处理中 [${mid}] 尝试 ${attempt}/${CONFIG.MAX_RETRY}`, "info");
-            await modifyVisible(mid, signal);
+            if (preview.action === "cancelQuickRepost") await destroyQuickRepost(preview.actionId, signal);
+            else await modifyVisible(preview.actionId, signal);
             stats.success++;
-            onLog(`✓ 已锁定 [${mid}] ${day}`, "success");
+            preview.completed = true;
+            if (preview.action === "cancelQuickRepost") {
+              stats.cancelledSuccess++;
+              onLog(`✓ 已取消快转 [${mid}] ${day}`, "success");
+            } else {
+              stats.lockedSuccess++;
+              preview.isPrivate = true;
+              onLog(`✓ 已锁定 [${mid}] ${day}`, "success");
+            }
             done = true;
             break;
           } catch (err) {
@@ -714,6 +852,20 @@
             if (err.code === "AUTH") {
               onLog(`鉴权失败，终止: ${err.message}`, "error");
               throw err;
+            }
+            if (err.code === "NOT_OWN") {
+              preview.action = "skip";
+              preview.skipReason = "notOwn";
+              stats.skipped++;
+              onLog(`跳过 [${mid}]：非本人微博，不支持修改可见性`, "muted");
+              done = true;
+              break;
+            }
+            if (err.code === "BUSINESS") {
+              preview.action = "skip";
+              preview.skipReason = "businessRejected";
+              onLog(`✗ 业务拒绝 [${mid}]: ${err.message}（不重试）`, "error");
+              break;
             }
             if (err.code === "RISK") {
               // Rate-limited: needs a long pause, not a short backoff.
@@ -728,9 +880,11 @@
               await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
               continue;
             }
-            const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
-            onLog(`重试 [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
-            await sleep(wait, signal);
+            if (attempt < CONFIG.MAX_RETRY) {
+              const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
+              onLog(`重试 [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
+              await sleep(wait, signal);
+            }
           }
         }
         if (!done) stats.failed++;
@@ -758,7 +912,7 @@
     }
 
     onLog(
-      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${stats.hits.filter((h) => !h.isPrivate).length}` +
+      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${countLockable(stats.hits)} · 待取消 ${countCancelable(stats.hits)}` +
         (dryRun ? "（预览，未实际修改）" : ""),
       "summary"
     );
@@ -793,8 +947,9 @@
    * @returns {Promise<object>} stats
    */
   async function runApiModeSearchProfile(opts) {
-    const { uid, starttime, endtime, onLog, onProgress, signal } = opts;
-    const stats = { success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
+    const { uid, starttime, endtime, cancelQuickReposts, onLog, onProgress, signal } = opts;
+    const stats = { success: 0, lockedSuccess: 0, cancelledSuccess: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
+    let privateSkipped = 0;
     const seenMids = new Set();
     let curEnd = endtime;
     let slice = 0;
@@ -867,22 +1022,25 @@
         newCount++;
         stats.scanned++; // unique mids only — do not count boundary re-fetches
 
-        const day = toDayStr(t);
-        const preview = {
-          mid,
-          date: day,
-          visible: visibleText(blog),
-          isPrivate: isPrivate(blog),
-          text: (blog.text_raw || "").slice(0, 40),
-        };
+        const preview = makePreviewItem(blog, uid, Boolean(cancelQuickReposts));
+        const day = preview.date;
         stats.hits.push(preview);
 
-        if (isPrivate(blog)) {
+        if (preview.skipReason === "alreadyPrivate") {
           stats.skipped++;
+          privateSkipped++;
           // 已锁定的不刷屏：前 3 条 + 每 50 条打一次进度
-          if (stats.skipped <= 3 || stats.skipped % 50 === 0) {
-            onLog(`跳过已锁定 ${stats.skipped} 条（最近 [${mid}] ${day}）`, "muted");
+          if (privateSkipped <= 3 || privateSkipped % 50 === 0) {
+            onLog(`跳过已锁定 ${privateSkipped} 条（最近 [${mid}] ${day}）`, "muted");
           }
+        } else if (preview.skipReason === "quickRepostDisabled") {
+          stats.skipped++;
+          onLog(`跳过快转 [${mid}] ${day}（未启用“同时取消快转”）`, "muted");
+        } else if (preview.skipReason === "missingOriMid") {
+          stats.skipped++;
+          onLog(`跳过快转 [${mid}] ${day}（缺少 ori_mid，无法安全取消）`, "warn");
+        } else if (preview.action === "cancelQuickRepost") {
+          onLog(`待取消快转 [${mid}] ${day} ${(blog.text_raw || "").slice(0, 20)}`, "warn");
         } else {
           onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
         }
@@ -921,7 +1079,7 @@
     }
 
     onLog(
-      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${stats.hits.filter((h) => !h.isPrivate).length}` +
+      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${countLockable(stats.hits)} · 待取消 ${countCancelable(stats.hits)}` +
         "（预览，未实际修改）",
       "summary"
     );
@@ -929,8 +1087,9 @@
   }
 
   /**
-   * Lock a list of weibos by mid, reusing the mids gathered during preview
-   * (avoids a second pagination sweep — halves request count + rate-limit exposure).
+   * Execute previewed actions without a second scan: all locks first, then all
+   * quick-repost cancellations. Completed items remain in the snapshot but are
+   * not requested again if the user presses「执行」a second time.
    *
    * Already-private items (preview snapshot) are bulk-counted into `skipped`
    * once at start — not walked one-by-one. Per-item "跳过" logs were already
@@ -940,75 +1099,117 @@
    * isPrivate is the PREVIEW value, not re-fetched at run time; if you change a
    * post's visibility manually between preview and run, that is NOT re-checked.
    *
-   * @param {Array<{mid:string, isPrivate:boolean, date?:string}>} hits
+   * @param {Array<{mid:string, actionId:string, action:string, completed:boolean, date?:string}>} hits
    */
   async function lockByIds(hits, { onLog, onProgress, signal }) {
-    const stats = { success: 0, skipped: 0, failed: 0, scanned: hits.length, hits };
-    // 已锁定的只计总数，不进逐条循环（避免千级跳过仍 rAF + onProgress 拖尾）
+    const stats = {
+      success: 0,
+      lockedSuccess: 0,
+      cancelledSuccess: 0,
+      skipped: 0,
+      failed: 0,
+      scanned: hits.length,
+      hits,
+    };
     const toLock = [];
+    const toCancel = [];
     for (const item of hits) {
-      if (item.isPrivate) stats.skipped++;
-      else toLock.push(item);
+      if (isPreviewLockable(item)) toLock.push(item);
+      else if (isPreviewCancelable(item)) toCancel.push(item);
+      else stats.skipped++;
     }
     onLog(
-      `— 执行开始（真实修改），待锁 ${toLock.length} 条` +
-        (stats.skipped ? `，已锁定跳过 ${stats.skipped} 条` : "") +
+      `— 执行开始（真实修改），待锁 ${toLock.length} 条，待取消快转 ${toCancel.length} 条` +
+        (stats.skipped ? `，自动跳过 ${stats.skipped} 条` : "") +
         ` —`,
       "info"
     );
     onProgress({ ...stats });
 
-    for (const item of toLock) {
-      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-      await yieldToRender(); // let the browser paint log/counters
-      const mid = String(item.mid);
-      const day = item.date || "";
-
-      let done = false;
-      for (let attempt = 1; attempt <= CONFIG.MAX_RETRY; attempt++) {
+    async function executePhase(items, action) {
+      for (const item of items) {
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-        try {
-          onLog(`处理中 [${mid}] 尝试 ${attempt}/${CONFIG.MAX_RETRY}`, "info");
-          await modifyVisible(mid, signal);
-          stats.success++;
-          // Mutate preview snapshot so a second「执行」won't re-lock the same mid.
-          item.isPrivate = true;
-          onLog(`✓ 已锁定 [${mid}] ${day}`, "success");
-          done = true;
-          break;
-        } catch (err) {
-          if (err.name === "AbortError") throw err;
-          if (err.code === "AUTH") {
-            onLog(`鉴权失败，终止: ${err.message}`, "error");
-            throw err;
-          }
-          if (err.code === "RISK") {
-            if (attempt >= CONFIG.MAX_RETRY) {
-              onLog(`✗ 风控/失败 [${mid}]: ${err.message}（已达最大重试）`, "error");
+        await yieldToRender();
+        const mid = String(item.mid);
+        const actionId = String(item.actionId || item.mid);
+        const day = item.date || "";
+        const verb = action === "lock" ? "锁定" : "取消快转";
+        let outcome = "failed";
+
+        for (let attempt = 1; attempt <= CONFIG.MAX_RETRY; attempt++) {
+          if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+          try {
+            onLog(`${verb}处理中 [${mid}] 尝试 ${attempt}/${CONFIG.MAX_RETRY}`, "info");
+            if (action === "lock") await modifyVisible(actionId, signal);
+            else await destroyQuickRepost(actionId, signal);
+
+            stats.success++;
+            item.completed = true;
+            if (action === "lock") {
+              stats.lockedSuccess++;
+              item.isPrivate = true;
+              onLog(`✓ 已锁定 [${mid}] ${day}`, "success");
+            } else {
+              stats.cancelledSuccess++;
+              onLog(`✓ 已取消快转 [${mid}] ${day}`, "success");
+            }
+            outcome = "success";
+            break;
+          } catch (err) {
+            if (err.name === "AbortError") throw err;
+            if (err.code === "AUTH") {
+              onLog(`鉴权失败，终止: ${err.message}`, "error");
+              throw err;
+            }
+            if (err.code === "NOT_OWN") {
+              item.action = "skip";
+              item.skipReason = "notOwn";
+              stats.skipped++;
+              onLog(`跳过 [${mid}]：非本人微博，不支持修改可见性`, "muted");
+              outcome = "skipped";
               break;
             }
-            onLog(
-              `限流 [${mid}]，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_RETRY}）`,
-              "warn"
-            );
-            await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
-            continue;
+            if (err.code === "BUSINESS") {
+              // A deterministic 4xx/ok:0 must not be retried now or on a blind
+              // second run. Keep its failure in this summary and retire action.
+              item.action = "skip";
+              item.skipReason = "businessRejected";
+              onLog(`✗ ${verb}失败 [${mid}]：${err.message}（业务拒绝，不重试）`, "error");
+              break;
+            }
+            if (err.code === "RISK") {
+              if (attempt >= CONFIG.MAX_RETRY) {
+                onLog(`✗ 风控/失败 [${mid}]: ${err.message}（已达最大重试）`, "error");
+                break;
+              }
+              onLog(
+                `限流 [${mid}]，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_RETRY}）`,
+                "warn"
+              );
+              await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+              continue;
+            }
+            if (attempt >= CONFIG.MAX_RETRY) {
+              onLog(`✗ ${verb}失败 [${mid}]: ${err.message}（已达最大重试）`, "error");
+              break;
+            }
+            const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
+            onLog(`重试${verb} [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
+            await sleep(wait, signal);
           }
-          const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
-          onLog(`重试 [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
-          await sleep(wait, signal);
         }
-      }
-      if (!done) stats.failed++;
+        if (outcome === "failed") stats.failed++;
 
-      onProgress({ ...stats });
-      // Human-like jitter on top of the window limiter, so request gaps
-      // aren't perfectly regular (regularity is itself a bot signal).
-      await sleep(randomDelayMs(1.0), signal);
+        onProgress({ ...stats });
+        await sleep(randomDelayMs(1.0), signal);
+      }
     }
 
+    await executePhase(toLock, "lock");
+    await executePhase(toCancel, "cancelQuickRepost");
+
     onLog(
-      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 共 ${stats.hits.length}`,
+      `完成 — 锁定成功 ${stats.lockedSuccess} · 取消成功 ${stats.cancelledSuccess} · 跳过 ${stats.skipped} · 失败 ${stats.failed}`,
       "summary"
     );
     return stats;
@@ -1048,6 +1249,7 @@
         mid: $("#wbl-mid-panel"),
         recent: $("#wbl-recent-panel"),
       },
+      cancelQuickReposts: $("#wbl-cancel-quick-reposts"),
       delay: $("#wbl-delay"),
       previewBtn: $("#wbl-preview"),
       runBtn: $("#wbl-run"),
@@ -1061,6 +1263,7 @@
         failed: $("#wbl-c-failed"),
         scanned: $("#wbl-c-scanned"),
         hits: $("#wbl-c-hits"),
+        cancel: $("#wbl-c-cancel"),
       },
       log: $("#wbl-log"),
       uidHint: $("#wbl-uid"),
@@ -1087,9 +1290,11 @@
     // filter switching
     function currentFilterCfg() {
       const type = els.filterRadios.find((r) => r.checked)?.value || "recent";
+      const cancelQuickReposts = Boolean(els.cancelQuickReposts.checked);
       if (type === "date") {
         return {
           type: "date",
+          cancelQuickReposts,
           start: $("#wbl-date-start").value.trim(),
           end: $("#wbl-date-end").value.trim(),
         };
@@ -1097,17 +1302,23 @@
       if (type === "before") {
         return {
           type: "before",
+          cancelQuickReposts,
           months: parseInt($("#wbl-before-months").value, 10) || 1,
         };
       }
       if (type === "mid") {
         return {
           type: "mid",
+          cancelQuickReposts,
           startMid: $("#wbl-mid-start").value.trim(),
           endMid: $("#wbl-mid-end").value.trim(),
         };
       }
-      return { type: "recent", n: Math.max(1, parseInt($("#wbl-recent-n").value, 10) || 10) };
+      return {
+        type: "recent",
+        cancelQuickReposts,
+        n: Math.max(1, parseInt($("#wbl-recent-n").value, 10) || 10),
+      };
     }
     function syncFilterPanels() {
       const type = els.filterRadios.find((r) => r.checked)?.value || "recent";
@@ -1154,11 +1365,10 @@
       els.counts.skipped.textContent = stats.skipped;
       els.counts.failed.textContent = stats.failed;
       els.counts.scanned.textContent = stats.scanned;
-      // 「待锁」= 命中且尚未仅自己可见（type!=1）。已锁定的只进「跳过」，不进此计数。
-      const lockable = Array.isArray(stats.hits)
-        ? stats.hits.filter((h) => !h.isPrivate).length
-        : 0;
+      // 「待锁」只计可执行项；已锁定与快转等不可修改项只进「跳过」。
+      const lockable = countLockable(stats.hits);
       els.counts.hits.textContent = lockable;
+      els.counts.cancel.textContent = countCancelable(stats.hits);
     }
 
     function setMode(mode) {
@@ -1220,6 +1430,7 @@
             }
             spOpts = {
               uid,
+              cancelQuickReposts: cfg.cancelQuickReposts,
               starttime: cfg.start ? dateStrToEpochSec(cfg.start, false) : undefined,
               endtime: cfg.end ? dateStrToEpochSec(cfg.end, true) : nowEpochSec(),
               onLog: log,
@@ -1231,6 +1442,7 @@
             const cutoffDay = cutoffDayMonthsAgo(Number(cfg.months));
             spOpts = {
               uid,
+              cancelQuickReposts: cfg.cancelQuickReposts,
               starttime: undefined, // no lower bound
               endtime: dateStrToEpochSec(cutoffDay, false),
               onLog: log,
@@ -1252,15 +1464,16 @@
           });
         }
         state.lastPreview = { hits: stats.hits, filterCfg: cfg, at: Date.now() };
-        const lockable = stats.hits.filter((h) => !h.isPrivate).length;
+        const lockable = countLockable(stats.hits);
+        const cancelable = countCancelable(stats.hits);
         log(
-          `预览完成 — 扫描 ${stats.scanned} · 待锁 ${lockable} · 已是仅自己可见 ${stats.skipped}`,
+          `预览完成 — 扫描 ${stats.scanned} · 待锁 ${lockable} · 待取消 ${cancelable} · 跳过 ${stats.skipped}`,
           "summary"
         );
-        if (lockable > 0) {
-          log(`点「执行」将锁定上述 ${lockable} 条（已锁定的会自动跳过）`, "info");
+        if (lockable > 0 || cancelable > 0) {
+          log(`点「执行」将锁定 ${lockable} 条、取消快转 ${cancelable} 条（跳过项不会发送请求）`, "info");
         } else {
-          log(`没有需要锁定的微博。`, "info");
+          log(`没有需要锁定或取消快转的项目。`, "info");
         }
       } catch (e) {
         if (e.name === "AbortError") log("预览已停止", "warn");
@@ -1289,16 +1502,20 @@
         return;
       }
       const hits = state.lastPreview.hits;
-      const toLock = hits.filter((h) => !h.isPrivate).length;
-      const alreadyPrivate = hits.length - toLock;
-      if (toLock === 0) {
-        log("命中的微博均已锁定，无需操作。", "summary");
+      const toLock = countLockable(hits);
+      const toCancel = countCancelable(hits);
+      const skipped = hits.length - toLock - toCancel;
+      if (toLock === 0 && toCancel === 0) {
+        log("没有待锁定或待取消的项目（均已完成或会自动跳过）。", "summary");
         return;
       }
       const ageMin = Math.round((Date.now() - state.lastPreview.at) / 60000);
       const ok = confirm(
-        `将把 ${toLock} 条微博设为「仅自己可见」（可恢复）。\n` +
-          `其中已锁定的 ${alreadyPrivate} 条会自动跳过。\n` +
+        `本次将分两步执行：\n` +
+          `1. 将锁定 ${toLock} 条微博（设为「仅自己可见」，可恢复）；\n` +
+          `2. 将取消快转 ${toCancel} 条（移除转发关系）；\n` +
+          `3. 跳过 ${skipped} 条。\n` +
+          (toCancel > 0 ? `\n停止操作不会回滚已经取消的快转。\n` : "") +
           (ageMin > 0 ? `（依据 ${ageMin} 分钟前的预览数据，如期间手动改动过，执行时会自动跳过/失败）\n` : "") +
           `\n确认执行？`
       );
@@ -1402,6 +1619,10 @@
     .wbl-label { display: block; color: #9aa0aa; font-size: 11px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: .3px; }
     .wbl-radios { display: flex; gap: 12px; flex-wrap: wrap; }
     .wbl-radios label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+    .wbl-option { display: flex; align-items: flex-start; gap: 6px; margin-top: 8px; cursor: pointer; }
+    .wbl-option input { margin-top: 3px; }
+    .wbl-option-text { display: flex; flex-direction: column; }
+    .wbl-option-text small { color: #6b7280; font-size: 10px; }
     .wbl-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
     .wbl-panel input[type=text], .wbl-panel input[type=date], .wbl-panel input[type=number], .wbl-panel select {
       background: #2c313a; border: 1px solid #3a3f4b; color: #e6e6e6;
@@ -1418,7 +1639,7 @@
     .wbl-run { background: #d97706; color: #fff; }
     .wbl-stop { background: #c0392b; color: #fff; }
     .wbl-clear { background: #4a4f5a; color: #fff; }
-    .wbl-counts { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin: 8px 0; }
+    .wbl-counts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; margin: 8px 0; }
     .wbl-count { background: #2c313a; border-radius: 5px; padding: 5px 4px; text-align: center; }
     .wbl-count b { display: block; font-size: 15px; }
     .wbl-count span { font-size: 10px; color: #9aa0aa; }
@@ -1426,6 +1647,7 @@
     .wbl-c-skipped b { color: #9aa0aa; }
     .wbl-c-failed b { color: #f87171; }
     .wbl-c-hits b { color: #60a5fa; }
+    .wbl-c-cancel b { color: #fbbf24; }
     .wbl-log {
       background: #15181d; border: 1px solid #2c313a; border-radius: 6px;
       padding: 6px 8px; height: 180px; overflow-y: auto; font-family: Consolas, monospace;
@@ -1447,7 +1669,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.6.7</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.6.9</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -1484,6 +1706,13 @@
             <span>~</span>
             <input type="text" id="wbl-mid-end" placeholder="结束 mid" inputmode="numeric">
           </div>
+          <label class="wbl-option">
+            <input type="checkbox" id="wbl-cancel-quick-reposts">
+            <span class="wbl-option-text">
+              <span>同时取消筛选范围内的快转</span>
+              <small>默认关闭；取消快转会移除转发关系，执行前会再次确认。</small>
+            </span>
+          </label>
         </div>
 
         <div class="wbl-section">
@@ -1506,6 +1735,7 @@
           <div class="wbl-count wbl-c-failed"><b id="wbl-c-failed">0</b><span>失败</span></div>
           <div class="wbl-count"><b id="wbl-c-scanned">0</b><span>已扫描</span></div>
           <div class="wbl-count wbl-c-hits"><b id="wbl-c-hits">0</b><span>待锁</span></div>
+          <div class="wbl-count wbl-c-cancel"><b id="wbl-c-cancel">0</b><span>待取消</span></div>
         </div>
 
         <div class="wbl-log" id="wbl-log"></div>
