@@ -44,3 +44,24 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: 修复 searchProfile total 饱和导致的扫描截断
+
+**Date**: 2026-08-29
+**Task**: 修复 searchProfile total 饱和导致的扫描截断
+**Branch**: `main`
+
+### Summary
+
+实测确认 searchProfile data.total 大窗口饱和(~1000±10)不可信，删除 total 早停；游标改含边界推进+seenMids 去重修复同秒组丢帖；同步修正 API 笔记第 6 节、quality-guidelines spec 与 AGENTS.md(版本记载 0.6.7+终止约定)。检查全过，待用户 Tampermonkey 重载复扫验证。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `615c343` | (see git log) |
+
+### Status
+
+[OK] **Completed**
