@@ -775,12 +775,15 @@
    * the `dryRun` flag only toggles the startup log line, kept for signature
    * parity with runApiMode.
    *
-   * Pagination (verified 2026-07-28 via live searchProfile):
+   * Pagination (re-verified 2026-08-29 via live searchProfile):
    *   - page/max_id/since_id are ignored; shrink `endtime` to walk older.
-   *   - Response includes `data.total` (server-side match count) — trust it to
-   *     stop when hits.length >= total, avoiding a wasteful second request that
-   *     only re-returns the boundary item (was inflating 已扫描: 15+1=16).
-   *   - Advance with `oldestEpoch - 1` so the boundary mid is not re-fetched.
+   *   - data.total 不可信（2026-08-29 实测）：大时间窗下是饱和近似值（~1000±10，
+   *     数值还会抖动），与窗口真实命中数脱钩（实测仅 47 条的窗口报 total=1007；
+   *     按相同游标走法收出 1242+ 条唯一 mid 仍未到底，total 仍报 1007）。禁止用
+   *     hits.length >= total 做早停；终止只靠空列表 / 本段无新 mid / 游标低于
+   *     starttime / MAX_PAGES_FALLBACK / 用户停止。
+   *   - 游标含边界推进（curEnd = oldestEpoch，不再 -1）：同秒组被 50 条分页
+   *     边界切开时，余下帖子能在下一段取回（seenMids 去重）。
    *   - `已扫描` counts unique mids only (not raw list.length across slices).
    *
    * @param {object} opts
@@ -798,7 +801,6 @@
     const seenMids = new Set();
     let curEnd = endtime;
     let slice = 0;
-    let serverTotal = null; // data.total from first non-empty response
 
     onLog(
       `【预览模式】用 searchProfile 按时间服务端筛选（不会修改任何微博）...` +
@@ -839,12 +841,6 @@
       if (list.length === 0) {
         onLog(`已扫描全部微博（第 ${slice} 段为空），结束。`, "info");
         break;
-      }
-
-      // Prefer server total (number or numeric string) so we can stop early.
-      if (serverTotal == null && pageData.total != null && pageData.total !== "") {
-        const t = Number(pageData.total);
-        if (Number.isFinite(t) && t >= 0) serverTotal = t;
       }
 
       await yieldToRender();
@@ -895,25 +891,24 @@
         break;
       }
 
-      // Server says we already have every match — skip the wasteful next slice
-      // that would only re-return the oldest boundary item.
-      if (serverTotal != null && stats.hits.length >= serverTotal) {
-        onLog(`已达服务端总数 ${serverTotal}，结束扫描。`, "info");
-        break;
-      }
-
       if (oldestEpoch == null) {
         onLog(`无法继续推进时间游标，结束扫描。`, "info");
         break;
       }
-      // Exclusive of the oldest item we already have (was: curEnd = oldest →
-      // next response re-included that mid, inflating 已扫描 by 1).
-      const nextEnd = oldestEpoch - 1;
-      if (nextEnd >= curEnd) {
+      // 含边界推进（curEnd = oldestEpoch，不再 -1）：若 50 条分页边界恰好切开
+      // 同一秒发布的多条微博，-1 会让余下同秒帖子既不在本段也不在下段，被静默
+      // 跳过；含边界推进时下一段必然带回它们（seenMids 去重，重复边界条目不会
+      // 重复收集，stats.scanned 本来就只计新 mid）。代价是每段最多多带 1-2 条
+      // 已见条目；窗口取空后由空列表或上面 newCount===0 终止，最多多花一次
+      // 收尾请求，正确性优先。
+      const nextEnd = oldestEpoch;
+      if (nextEnd > curEnd) {
         onLog(`无法继续推进时间游标，结束扫描。`, "info");
         break;
       }
       if (starttime != null && nextEnd < starttime) {
+        // nextEnd == starttime 时继续走：起点秒上的同秒组可能被分页边界切开，
+        // 下一段（endtime=starttime）要把余下帖子取回后才由无新 mid 终止。
         onLog(`时间游标已低于起始时间，结束扫描。`, "info");
         break;
       }

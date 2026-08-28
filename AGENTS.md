@@ -67,7 +67,8 @@ Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** 
 ### Safety & UX
 - Dry-run default; real run needs second `confirm()`. Thread `AbortController` through every async path (Stop mid-scan).
 - Tight await-loops must `await yieldToRender()` or the panel freezes while requests still fire.
-- **Version sync:** bump **both** `// @version` header **and** `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.6.6`).
+- **Version sync:** bump **both** `// @version` header **and** `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.6.7`).
+- **searchProfile 终止条件:** `data.total` 大窗口下饱和不可信（~1000±10，与窗口内容脱钩），禁做终止条件；游标**含边界**推进（`curEnd = oldestEpoch`）+ `seenMids` 去重，`-1` 不含边界会丢跨分页边界的同秒帖（2026-08-29 实测，见 API 笔记第 6 节）。
 
 ## Conventions
 
