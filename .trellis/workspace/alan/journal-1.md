@@ -65,3 +65,24 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: modifyVisible 永久失败 PERM 不重试 + 控制台报错
+
+**Date**: 2026-08-29
+**Task**: modifyVisible 永久失败 PERM 不重试 + 控制台报错
+**Branch**: `main`
+
+### Summary
+
+实测 modifyVisible 400+message「暂不支持变更可见范围」为永久拒绝：modifyVisible 读响应体(兼容 message/msg)标 PERM，两条路径(runApiMode/lockByIds)遇 PERM 单次失败不重试；两失败点 console.error([wbl]前缀+mid+状态+原文)便于 DevTools 调试；版本 0.6.8 双处；API 笔记第 3 节、quality-guidelines、AGENTS.md 同步。检查 8/8 通过。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `2841165` | (see git log) |
+
+### Status
+
+[OK] **Completed**
