@@ -1,0 +1,5 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md", "reason": "searchProfile 契约与本次要修正的 total/游标结论（2026-08-29 实测）"}
+{"file": ".trellis/spec/guides/third-party-api-verification-guide.md", "reason": "外部 API 行为结论的验证与记录规范"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "本仓库用户脚本质量约定"}
+{"file": "AGENTS.md", "reason": "硬性不变量：版本号双处同步、限流、终止语义、提交规范"}
