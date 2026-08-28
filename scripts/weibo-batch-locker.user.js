@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.6.8
+// @version      0.7.0
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
@@ -14,20 +14,31 @@
 /* global window, document, fetch, URLSearchParams, AbortController, confirm */
 
 /*
- * Interface contracts (verified first-hand 2026-07-27, see
+ * Interface contracts (verified first-hand 2026-07-27 / 2026-08-29, see
  * .trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md):
  *
  *   List:  GET /ajax/statuses/mymblog?uid=&page=&feature=0[&since_id=]
  *          -> { ok:1, data:{ list:[{id, mid, visible:{type,list_id}, created_at, text_raw}], total, since_id } }
  *
  *   Lock:  POST /ajax/statuses/modifyVisible
- *          Body (form): ids=<mid>&visible=1   (visible is a STRING "1")
+ *          Body (form): ids=<idstr>&visible=1   (visible is a STRING "1")
  *          Headers: x-xsrf-token (from document.cookie XSRF-TOKEN), x-requested-with
  *          -> { ok:>0, statuses:[...] }
+ *
+ *   Delete: POST /ajax/statuses/destroy   (IRREVERSIBLE — opt-in fallback only)
+ *          Body: JSON {"id":"<idstr>"}  ⚠️ JSON ONLY (form-encoded is gateway-400'd)
+ *          -> HTTP 200 + deleted status object (`ok` may be absent; 2xx = success)
+ *          Posts that modifyVisible PERM-rejects (暂不支持变更可见范围) ARE
+ *          deletable (verified 2026-08-29, API notes §8).
  *
  *   Visibility enum (from weibo-pro-next bundle):
  *     0=公开 1=仅自己可见 6=好友圈(list) 9=受限 10=粉丝 3=付费会员
  *     Only "仅自己可见" (1) is used here.
+ *
+ *   ⚠️ Identity: idstr is canonical EVERYWHERE (dedup, filters, modifyVisible,
+ *      destroy). 2010-era posts have id ≠ mid (idstr "1315558541" vs mid
+ *      "20110072529369342"); the mutating APIs take the idstr. Modern posts
+ *      have id == idstr == mid, so only old-post behavior changes.
  */
 
 (function () {
@@ -180,6 +191,17 @@
     return a < b ? -1 : a > b ? 1 : 0;
   }
 
+  /**
+   * Canonical weibo id (idstr) used for ALL operations (modifyVisible/destroy),
+   * dedup and filters. ⚠️ For 2010-era posts id ≠ mid (verified 2026-08-29:
+   * idstr "1315558541" vs mid "20110072529369342") and the mutating APIs take
+   * the idstr. Modern posts have id == idstr == mid, so only old-post behavior
+   * changes.
+   */
+  function statusId(blog) {
+    return String((blog && (blog.idstr ?? blog.id ?? blog.mid)) ?? "");
+  }
+
   /** True if the weibo is already "仅自己可见". Always returns a boolean.
    *  Coerces type so both number 1 and string "1" count (API drift has done both). */
   function isPrivate(blog) {
@@ -295,8 +317,10 @@
    *   window.$VERSION = { CLIENT: "3.0.0", SERVER: "v2026.07.23.1" }
    * We mirror that; scrape / fallback only if $VERSION is missing (early boot).
    */
-  const CLIENT_VERSION_FALLBACK = "3.0.0";
-  const SERVER_VERSION_FALLBACK = "v2026.07.23.1";
+  // Fallbacks re-captured 2026-08-29 ($VERSION format drifted: CLIENT is now
+  // "vX.Y.NNN" style, e.g. "v1.1.243", no longer plain "3.0.0").
+  const CLIENT_VERSION_FALLBACK = "v1.1.243";
+  const SERVER_VERSION_FALLBACK = "v2026.08.27.1";
   let cachedClientVersion = null;
   let cachedServerVersion = null;
 
@@ -324,7 +348,7 @@
     // Late fallback: scrape inline boot script `CLIENT: 'x.y.z'`
     try {
       const head = (document.head && document.head.innerHTML) || "";
-      const m = head.match(/CLIENT\s*:\s*['"]([\d.]+)['"]/);
+      const m = head.match(/CLIENT\s*:\s*['"]([\w.-]+)['"]/);
       if (m) {
         cachedClientVersion = m[1];
         return cachedClientVersion;
@@ -478,6 +502,59 @@
   }
 
   /**
+   * Delete one of the user's own weibos. IRREVERSIBLE — used ONLY as an
+   * explicit opt-in fallback for posts that modifyVisible permanently rejects
+   * (PERM: 「此条微博暂不支持变更可见范围」). Deleting such posts verified
+   * first-hand 2026-08-29 (API notes §8).
+   *
+   * Contract (from weibo-pro-next bundle `index-CrmZ_Ne1.js`, 4 call sites):
+   *   POST /ajax/statuses/destroy   Content-Type: application/json
+   *   Body: {"id":"<idstr>"}   ⚠️ id (= idstr), NOT mid; JSON ONLY —
+   *   form-encoded bodies are rejected by the gateway with a plain HTML 400.
+   *   Success: HTTP 200 + the deleted status object (the `ok` field may be
+   *   absent entirely — 2xx without a business error means success).
+   *   Not found: {"ok":0,"message":"该微博不存在","error_code":20101}.
+   */
+  async function destroyStatus(id, signal) {
+    await rateLimiter.acquire(signal); // global sliding-window throttle
+    const res = await fetch("https://weibo.com/ajax/statuses/destroy", {
+      method: "POST",
+      // apiHeaders(false) 不带 form content-type，这里显式 JSON（destroy 只吃 JSON）。
+      headers: { ...apiHeaders(false), "content-type": "application/json" },
+      body: JSON.stringify({ id: String(id) }),
+      credentials: "include",
+      signal,
+    });
+    if (res.status === 403) {
+      const e = new Error("Cookie 已过期或未登录 (HTTP 403)");
+      e.code = "AUTH";
+      throw e;
+    }
+    if (res.status === 414 || res.status === 429) {
+      const e = new Error(`访问频次过快，被微博限流 (HTTP ${res.status})`);
+      e.code = "RISK";
+      throw e;
+    }
+    if (!res.ok) {
+      console.error("[wbl] destroy 失败:", id, "HTTP " + res.status);
+      const e = new Error(`destroy HTTP ${res.status}`);
+      e.code = "API";
+      throw e;
+    }
+    const data = await res.json().catch(() => null);
+    if (data && data.ok != null && !(data.ok > 0)) {
+      const msg = data.msg || data.message || "";
+      const e = new Error(`destroy ok=${data.ok} ${msg}`.trim());
+      if (/频次|频繁|过快|limit|too many/i.test(msg)) e.code = "RISK";
+      else if (data.ok === -100 || /login|登录/i.test(msg)) e.code = "AUTH";
+      else e.code = "API";
+      console.error("[wbl] destroy 业务失败:", id, msg);
+      throw e;
+    }
+    return data;
+  }
+
+  /**
    * Fetch one page of the user's own weibos filtered server-side by time range
    * via searchProfile. Returns data.data. Used by "时间预设"/"日期范围" filters
    * to avoid the cost of full-timeline pagination that mymblog would require.
@@ -545,7 +622,7 @@
 
   function byMidRange(blogs, { startMid, endMid }) {
     return blogs.filter((b) => {
-      const m = String(b.mid || b.id);
+      const m = statusId(b);
       if (startMid && cmpMid(m, startMid) < 0) return false;
       if (endMid && cmpMid(m, endMid) > 0) return false;
       return true;
@@ -626,8 +703,8 @@
    * @returns {Promise<object>} stats { success, skipped, failed, scanned, hits }
    */
   async function runApiMode(opts) {
-    const { uid, filterCfg, dryRun, onLog, onProgress, signal } = opts;
-    const stats = { success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
+    const { uid, filterCfg, dryRun, deletePerm, onLog, onProgress, signal } = opts;
+    const stats = { success: 0, skipped: 0, failed: 0, deleted: 0, scanned: 0, hits: [] };
     let page = 1;
     let sinceId = null;
 
@@ -692,7 +769,7 @@
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         await yieldToRender(); // let the browser paint log/counters
 
-        const mid = String(blog.mid || blog.id);
+        const mid = statusId(blog);
         const day = toDayStr(parseWeiboDate(blog.created_at));
         const preview = {
           mid,
@@ -750,8 +827,28 @@
               continue;
             }
             // PERM：服务端永久拒绝（该微博类型不支持变更可见范围），重试必然失败。
+            // 删除兜底（面板显式勾选，不可逆）：改调 destroy 直接删除。
             if (err.code === "PERM") {
-              onLog(`✗ 不支持变更 [${mid}]: ${err.message}（不重试）`, "error");
+              if (deletePerm) {
+                try {
+                  onLog(`🗑 不支持变更，改删除 [${mid}] ...`, "warn");
+                  await destroyStatus(mid, signal);
+                  stats.deleted++;
+                  const h = stats.hits.find((x) => x.mid === mid);
+                  if (h) h.isPrivate = true; // 防止二次「执行」再打已删除的 mid
+                  onLog(`🗑 已删除 [${mid}] ${day}（不支持变更可见范围，不可恢复）`, "success");
+                  done = true;
+                } catch (dErr) {
+                  if (dErr.name === "AbortError") throw dErr;
+                  if (dErr.code === "AUTH") {
+                    onLog(`鉴权失败，终止: ${dErr.message}`, "error");
+                    throw dErr;
+                  }
+                  onLog(`✗ 删除失败 [${mid}]: ${dErr.message}`, "error");
+                }
+              } else {
+                onLog(`✗ 不支持变更 [${mid}]: ${err.message}（不重试）`, "error");
+              }
               break;
             }
             const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
@@ -784,7 +881,7 @@
     }
 
     onLog(
-      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${stats.hits.filter((h) => !h.isPrivate).length}` +
+      `完成 — 成功 ${stats.success} · 已删 ${stats.deleted} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 待锁 ${stats.hits.filter((h) => !h.isPrivate).length}` +
         (dryRun ? "（预览，未实际修改）" : ""),
       "summary"
     );
@@ -811,6 +908,10 @@
    *   - 游标含边界推进（curEnd = oldestEpoch，不再 -1）：同秒组被 50 条分页
    *     边界切开时，余下帖子能在下一段取回（seenMids 去重）。
    *   - `已扫描` counts unique mids only (not raw list.length across slices).
+   *   - mymblog 兜底（2026-08-29 实测）：searchProfile 索引对深历史覆盖不全
+   *     （本账号 ~4821 条/2010-04 见底，服务端多索引不一致），游标走法没走到
+   *     starttime 就停（空段/无新 mid/游标停滞）时，自动切换 mymblog 全量时间线
+   *     （~20 条/页，page 可冷跳，空页 = 账号真正到底）补收窗口内剩余微博。
    *
    * @param {object} opts
    * @param {string}  opts.uid
@@ -823,10 +924,11 @@
    */
   async function runApiModeSearchProfile(opts) {
     const { uid, starttime, endtime, onLog, onProgress, signal } = opts;
-    const stats = { success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] };
+    const stats = { success: 0, skipped: 0, failed: 0, deleted: 0, scanned: 0, hits: [] };
     const seenMids = new Set();
     let curEnd = endtime;
     let slice = 0;
+    let coveredToStart = false; // 游标是否已越过 starttime（真覆盖完，无需兜底）
 
     onLog(
       `【预览模式】用 searchProfile 按时间服务端筛选（不会修改任何微博）...` +
@@ -878,7 +980,7 @@
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         await yieldToRender();
 
-        const mid = String(blog.mid || blog.id);
+        const mid = statusId(blog);
         // Track the oldest (smallest epoch) seen this slice for cursor advance.
         const t = parseWeiboDate(blog.created_at);
         const epoch = t ? Math.floor(t.getTime() / 1000) : null;
@@ -936,9 +1038,96 @@
         // nextEnd == starttime 时继续走：起点秒上的同秒组可能被分页边界切开，
         // 下一段（endtime=starttime）要把余下帖子取回后才由无新 mid 终止。
         onLog(`时间游标已低于起始时间，结束扫描。`, "info");
+        coveredToStart = true;
         break;
       }
       curEnd = nextEnd;
+    }
+
+    // —— mymblog 兜底（2026-08-29 实测）：searchProfile 索引对深历史覆盖不全 ——
+    // 本账号游标走法只收到 ~4821 条、在 ~2010-04 见底（其 total 也只报 ~4800，
+    // 与 mymblog total ≈8270 差 ~3400 条；同窗口偶发又能查到老帖 = 多索引不一致）。
+    // 游标走法没走到 starttime 就停（空段 / 无新 mid / 游标停滞）时，切 mymblog
+    // 全量时间线补收：~20 条/页、page 可冷跳（实测深页直接可用）、空页 = 真到底。
+    // 估算起点页 = 已收集唯一数 ÷ 20 再往前留 30 页裕量，覆盖两边排序错位；
+    // 已收过的靠 seenMids 去重，重复页只是少量额外请求，正确性优先。
+    if (!coveredToStart) {
+      onLog(`searchProfile 索引疑似见底，切换 mymblog 全量时间线补扫更早微博...`, "info");
+      let mpage = Math.max(1, Math.floor(stats.scanned / 20) - 30);
+      for (; mpage < CONFIG.MAX_PAGES_FALLBACK; mpage++) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+        let mData = null;
+        for (let attempt = 1; attempt <= CONFIG.MAX_PAGE_RETRY; attempt++) {
+          if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+          try {
+            // 不带 since_id 的 page 冷跳（2026-08-29 实测深页可用）
+            mData = await fetchBlogPage({ uid, page: mpage }, signal);
+            break;
+          } catch (err) {
+            if (err.name === "AbortError") throw err;
+            if (err.code === "AUTH") throw err;
+            if (err.code === "RISK" && attempt < CONFIG.MAX_PAGE_RETRY) {
+              onLog(
+                `mymblog 第 ${mpage} 页被限流，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
+                "warn"
+              );
+              await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+              continue;
+            }
+            onLog(`mymblog 第 ${mpage} 页拉取失败: ${err.message}，结束补扫。`, "error");
+            mData = null;
+            break;
+          }
+        }
+        if (!mData) break;
+        const mList = mData.list || [];
+        if (mList.length === 0) {
+          onLog(`mymblog 空页，全量时间线已到账号最早，扫描结束。`, "info");
+          break;
+        }
+        await yieldToRender();
+        // 日期范围模式：本页最新一条已早于 starttime → 已越出窗口下界，补扫完成
+        if (starttime != null) {
+          const firstT = parseWeiboDate(mList[0].created_at);
+          if (firstT && Math.floor(firstT.getTime() / 1000) < starttime) {
+            onLog(`mymblog 已越过起始时间，补扫结束。`, "info");
+            break;
+          }
+        }
+        for (const blog of mList) {
+          if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+          await yieldToRender();
+          const mid = statusId(blog);
+          if (seenMids.has(mid)) continue;
+          const t = parseWeiboDate(blog.created_at);
+          const epoch = t ? Math.floor(t.getTime() / 1000) : null;
+          // 只收窗口内：epoch <= endtime（before 模式 endtime=截止日 00:00:00，
+          // 恰好实现「严格早于截止日」）；有 starttime 时再卡下界。
+          if (epoch == null || epoch > endtime) continue;
+          if (starttime != null && epoch < starttime) continue;
+          seenMids.add(mid);
+          stats.scanned++;
+          const day = toDayStr(t);
+          const preview = {
+            mid,
+            date: day,
+            visible: visibleText(blog),
+            isPrivate: isPrivate(blog),
+            text: (blog.text_raw || "").slice(0, 40),
+          };
+          stats.hits.push(preview);
+          if (isPrivate(blog)) {
+            stats.skipped++;
+            if (stats.skipped <= 3 || stats.skipped % 50 === 0) {
+              onLog(`跳过已锁定 ${stats.skipped} 条（最近 [${mid}] ${day}）`, "muted");
+            }
+          } else {
+            onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
+          }
+          onProgress({ ...stats });
+        }
+        if (mpage % 25 === 0) onLog(`mymblog 补扫进行中：第 ${mpage} 页，已扫描 ${stats.scanned}`, "muted");
+      }
     }
 
     onLog(
@@ -963,8 +1152,8 @@
    *
    * @param {Array<{mid:string, isPrivate:boolean, date?:string}>} hits
    */
-  async function lockByIds(hits, { onLog, onProgress, signal }) {
-    const stats = { success: 0, skipped: 0, failed: 0, scanned: hits.length, hits };
+  async function lockByIds(hits, { onLog, onProgress, signal, deletePerm }) {
+    const stats = { success: 0, skipped: 0, failed: 0, deleted: 0, scanned: hits.length, hits };
     // 已锁定的只计总数，不进逐条循环（避免千级跳过仍 rAF + onProgress 拖尾）
     const toLock = [];
     for (const item of hits) {
@@ -1016,8 +1205,27 @@
             continue;
           }
           // PERM：服务端永久拒绝（该微博类型不支持变更可见范围），重试必然失败。
+          // 删除兜底（面板显式勾选，不可逆）：改调 destroy 直接删除。
           if (err.code === "PERM") {
-            onLog(`✗ 不支持变更 [${mid}]: ${err.message}（不重试）`, "error");
+            if (deletePerm) {
+              try {
+                onLog(`🗑 不支持变更，改删除 [${mid}] ...`, "warn");
+                await destroyStatus(mid, signal);
+                stats.deleted++;
+                item.isPrivate = true; // 防止二次「执行」再打已删除的 mid
+                onLog(`🗑 已删除 [${mid}] ${day}（不支持变更可见范围，不可恢复）`, "success");
+                done = true;
+              } catch (dErr) {
+                if (dErr.name === "AbortError") throw dErr;
+                if (dErr.code === "AUTH") {
+                  onLog(`鉴权失败，终止: ${dErr.message}`, "error");
+                  throw dErr;
+                }
+                onLog(`✗ 删除失败 [${mid}]: ${dErr.message}`, "error");
+              }
+            } else {
+              onLog(`✗ 不支持变更 [${mid}]: ${err.message}（不重试）`, "error");
+            }
             break;
           }
           const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
@@ -1034,7 +1242,7 @@
     }
 
     onLog(
-      `完成 — 成功 ${stats.success} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 共 ${stats.hits.length}`,
+      `完成 — 成功 ${stats.success} · 已删 ${stats.deleted} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 共 ${stats.hits.length}`,
       "summary"
     );
     return stats;
@@ -1083,6 +1291,7 @@
       body: $("#wbl-body"),
       counts: {
         success: $("#wbl-c-success"),
+        deleted: $("#wbl-c-deleted"),
         skipped: $("#wbl-c-skipped"),
         failed: $("#wbl-c-failed"),
         scanned: $("#wbl-c-scanned"),
@@ -1177,6 +1386,7 @@
     function setCounts(stats) {
       if (!stats) return;
       els.counts.success.textContent = stats.success;
+      els.counts.deleted.textContent = stats.deleted || 0;
       els.counts.skipped.textContent = stats.skipped;
       els.counts.failed.textContent = stats.failed;
       els.counts.scanned.textContent = stats.scanned;
@@ -1232,6 +1442,8 @@
       setMode("previewing");
       state.abortCtrl = new AbortController();
       log("— 预览开始 —", "info");
+      if ($("#wbl-delete-perm").checked)
+        log("⚠ 删除兜底已开启：执行时「不支持变更可见范围」的微博将被直接删除（不可恢复）", "warn");
       try {
         let stats;
         if (cfg.type === "date" || cfg.type === "before") {
@@ -1322,9 +1534,11 @@
         return;
       }
       const ageMin = Math.round((Date.now() - state.lastPreview.at) / 60000);
+      const deletePerm = $("#wbl-delete-perm").checked;
       const ok = confirm(
         `将把 ${toLock} 条微博设为「仅自己可见」（可恢复）。\n` +
           `其中已锁定的 ${alreadyPrivate} 条会自动跳过。\n` +
+          (deletePerm ? `⚠ 已开启删除兜底：无法改为仅自己可见的微博将被【直接删除，不可恢复】\n` : "") +
           (ageMin > 0 ? `（依据 ${ageMin} 分钟前的预览数据，如期间手动改动过，执行时会自动跳过/失败）\n` : "") +
           `\n确认执行？`
       );
@@ -1340,6 +1554,7 @@
           onLog: log,
           onProgress: setCounts,
           signal: state.abortCtrl.signal,
+          deletePerm,
         });
       } catch (e) {
         if (e.name === "AbortError") log("执行已停止（已完成的不会回滚）", "warn");
@@ -1362,7 +1577,7 @@
     els.stopBtn.addEventListener("click", doStop);
     els.clearBtn.addEventListener("click", () => {
       els.log.innerHTML = "";
-      setCounts({ success: 0, skipped: 0, failed: 0, scanned: 0, hits: [] });
+      setCounts({ success: 0, deleted: 0, skipped: 0, failed: 0, scanned: 0, hits: [] });
       state.lastPreview = null; // drop cached mids so「执行」不能用旧预览
       log("已清空日志与预览缓存，请重新预览后再执行。", "info");
     });
@@ -1444,13 +1659,14 @@
     .wbl-run { background: #d97706; color: #fff; }
     .wbl-stop { background: #c0392b; color: #fff; }
     .wbl-clear { background: #4a4f5a; color: #fff; }
-    .wbl-counts { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; margin: 8px 0; }
+    .wbl-counts { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin: 8px 0; }
     .wbl-count { background: #2c313a; border-radius: 5px; padding: 5px 4px; text-align: center; }
     .wbl-count b { display: block; font-size: 15px; }
     .wbl-count span { font-size: 10px; color: #9aa0aa; }
     .wbl-c-success b { color: #34d399; }
     .wbl-c-skipped b { color: #9aa0aa; }
     .wbl-c-failed b { color: #f87171; }
+    .wbl-c-deleted b { color: #fbbf24; }
     .wbl-c-hits b { color: #60a5fa; }
     .wbl-log {
       background: #15181d; border: 1px solid #2c313a; border-radius: 6px;
@@ -1473,7 +1689,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.6.8</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.7.0</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -1519,6 +1735,16 @@
           <div class="wbl-hint">越小越保守（默认 3 ≈ 每 3.3 秒 1 次）。被风控过就调小到 1~2。</div>
         </div>
 
+        <div class="wbl-section">
+          <span class="wbl-label">删除兜底（不可逆）</span>
+          <div class="wbl-row">
+            <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer">
+              <input type="checkbox" id="wbl-delete-perm"> 删除「不支持改可见范围」的微博
+            </label>
+          </div>
+          <div class="wbl-hint">默认关闭。开启后执行时遇到服务端永久拒绝（暂不支持变更可见范围）的微博将调用删除接口直接删除——不可恢复，谨慎开启。</div>
+        </div>
+
         <div class="wbl-btns">
           <button class="wbl-btn wbl-preview" id="wbl-preview">预览(dry-run)</button>
           <button class="wbl-btn wbl-run" id="wbl-run">执行</button>
@@ -1528,6 +1754,7 @@
 
         <div class="wbl-counts">
           <div class="wbl-count wbl-c-success"><b id="wbl-c-success">0</b><span>成功</span></div>
+          <div class="wbl-count wbl-c-deleted"><b id="wbl-c-deleted">0</b><span>已删</span></div>
           <div class="wbl-count wbl-c-skipped"><b id="wbl-c-skipped">0</b><span>跳过</span></div>
           <div class="wbl-count wbl-c-failed"><b id="wbl-c-failed">0</b><span>失败</span></div>
           <div class="wbl-count"><b id="wbl-c-scanned">0</b><span>已扫描</span></div>
