@@ -35,11 +35,29 @@ Bump **both** `// @version` in the userscript header and `<small>vX.X.X</small>`
 
 ---
 
+## SearchProfile Scan Termination
+
+**What**: `runApiModeSearchProfile` must terminate on: empty slice / `newCount === 0`（无新 mid）/ cursor below `starttime` / `MAX_PAGES_FALLBACK` / abort. The cursor advances **inclusively** (`curEnd = oldestEpoch`) with `seenMids` dedupe — never `oldestEpoch - 1`.
+
+**Why**: `searchProfile` 的 `data.total` 在大时间窗下是饱和近似值（~1000±10，且与窗口内容脱钩），拿它做 `hits >= total` 早停会在 ~1000 条处静默截断深历史扫描（2026-08-29 实测，详见 API 笔记第 6 节）。`-1` 不含边界推进则会在 50 条分页边界切开**同秒发布组**时丢帖——被切开的余下同秒帖子两个窗口都取不到。
+
+```js
+// Good — inclusive advance, dedupe via seenMids, terminate on no-new-mid
+const nextEnd = oldestEpoch;
+if (nextEnd > curEnd) break;           // no progress → newCount===0 will catch it
+// Bad — total early-stop truncates deep history; -1 drops same-second tails
+if (stats.hits.length >= serverTotal) break;
+const nextEnd = oldestEpoch - 1;
+```
+
+---
+
 ## Forbidden Patterns
 
 - Caching uid only at `createPanel` without SPA / action re-read
 - Using URL profile id when the goal is locking the logged-in user's posts
 - Fixed request delays instead of the global sliding-window `rateLimiter` (see `AGENTS.md`)
+- Trusting `searchProfile` `data.total` as a termination condition; exclusive (`-1`) cursor advance
 
 ---
 
