@@ -58,6 +58,7 @@ const nextEnd = oldestEpoch - 1;
 - Using URL profile id when the goal is locking the logged-in user's posts
 - Fixed request delays instead of the global sliding-window `rateLimiter` (see `AGENTS.md`)
 - Trusting `searchProfile` `data.total` as a termination condition; exclusive (`-1`) cursor advance
+- Retrying permanent business rejections as transient errors: `modifyVisible` HTTP 400 + 「暂不支持变更可见范围」（响应体字段是 `message` 不是 `msg`）→ `PERM` 码，单条只发 1 次请求；失败详情用 `console.error("[wbl] ...")` 输出到 DevTools（2026-08-29 实测，见 API 笔记第 3 节）
 
 ---
 
