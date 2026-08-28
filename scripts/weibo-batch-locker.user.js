@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.6.7
+// @version      0.6.8
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
@@ -442,15 +442,36 @@
       e.code = "RISK";
       throw e;
     }
-    if (!res.ok) throw new Error(`modifyVisible HTTP ${res.status}`);
+    if (!res.ok) {
+      // 非 2xx 时尝试读响应体里的服务端 message（2026-08-29 实测：永久拒绝返回
+      // HTTP 400 + {"ok":0,"message":"此条微博暂不支持变更可见范围。"}，字段名是
+      // message 不是 msg）。非 JSON 响应体（如网关 HTML）回退通用文案，解析失败
+      // 绝不抛新异常。PERM = 服务端永久拒绝（该微博类型不支持变更可见范围），
+      // 重试无意义；console 输出便于 DevTools 调试。
+      let srv = "";
+      try {
+        const body = await res.json();
+        srv = (body && (body.message || body.msg)) || "";
+      } catch (_) {
+        // 响应体非 JSON：保持通用错误文案
+      }
+      console.error("[wbl] modifyVisible 失败:", mid, "HTTP " + res.status, srv || "(无可解析响应体)");
+      const e = new Error(`modifyVisible HTTP ${res.status}${srv ? ` ${srv}` : ""}`);
+      if (/暂不支持/.test(srv)) e.code = "PERM";
+      throw e;
+    }
     const data = await res.json();
     if (!(data.ok > 0)) {
-      const msg = data.msg || "";
+      // 字段名兼容 message 与 msg（2026-08-29 实测：400 路径用 message）。
+      const msg = data.msg || data.message || "";
       const e = new Error(`modifyVisible ok=${data.ok} ${msg}`.trim());
-      // ok<=0: rate-limit wording → long RISK pause; auth → stop; else short backoff.
+      // ok<=0 分类：限流措辞 → 长 RISK 暂停；登录 → AUTH 终止；「暂不支持」→
+      // PERM（服务端永久拒绝，重试无意义）；其余短退避重试。
       if (/频次|频繁|过快|limit|too many/i.test(msg)) e.code = "RISK";
       else if (data.ok === -100 || /login|登录/i.test(msg)) e.code = "AUTH";
+      else if (/暂不支持/.test(msg)) e.code = "PERM";
       else e.code = "API";
+      console.error("[wbl] modifyVisible 业务失败:", mid, "ok=" + data.ok, msg);
       throw e;
     }
     return data;
@@ -728,6 +749,11 @@
               await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
               continue;
             }
+            // PERM：服务端永久拒绝（该微博类型不支持变更可见范围），重试必然失败。
+            if (err.code === "PERM") {
+              onLog(`✗ 不支持变更 [${mid}]: ${err.message}（不重试）`, "error");
+              break;
+            }
             const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
             onLog(`重试 [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
             await sleep(wait, signal);
@@ -988,6 +1014,11 @@
             );
             await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
             continue;
+          }
+          // PERM：服务端永久拒绝（该微博类型不支持变更可见范围），重试必然失败。
+          if (err.code === "PERM") {
+            onLog(`✗ 不支持变更 [${mid}]: ${err.message}（不重试）`, "error");
+            break;
           }
           const wait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, attempt - 1);
           onLog(`重试 [${mid}] ${err.message}，${wait / 1000}s 后重试`, "warn");
@@ -1442,7 +1473,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.6.7</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.6.8</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">

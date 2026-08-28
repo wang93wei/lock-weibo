@@ -124,6 +124,13 @@ Body: ids=<mid>&visible=1
 - **`visible` 值用字符串 `"1"`**（前端源码如此）。`ids` 是单个 mid。
 - ⚠️ 前端用 axios POST JSON，但 WeiBoHideTool 的 Python 实现用 `application/x-www-form-urlencoded` 表单 `ids=<mid>&visible=1`（数字）也能成功。**两个编码都验证过可工作**；脚本采用表单编码（与 `Content-Type: application/x-www-form-urlencoded` 配 `ids`/`visible` 字段），更接近 RESTful 习惯且实测路径已被验证。
 
+**永久失败（2026-08-29 实测）**：部分微博 `modifyVisible` 返回 **HTTP 400** +
+响应体 `{"ok":0,"message":"此条微博暂不支持变更可见范围。"}`。注意字段名是
+`message`（与常见 `msg` 不同）。语义：该微博类型**永久不可变更可见范围**，属
+服务端业务拒绝而非限流/登录问题，重试必然失败。脚本以 `PERM` 错误码识别
+（错误文案含服务端 `message` 原文），单次失败即停止重试（每条只发 1 次 POST），
+并在浏览器控制台输出 `[wbl]` 前缀的失败原因，便于 DevTools 调试。
+
 ## 4. 鉴权
 
 - **同源 cookie**：脚本运行在 `weibo.com`，`fetch(url, {credentials:"include"})` 自动携带全部 cookie（含 `SUB`/`SUBP`/`SSOLoginState` 等）。**无需手填 cookie。**

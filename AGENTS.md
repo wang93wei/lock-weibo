@@ -46,6 +46,7 @@ Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** 
 ### Rate limit & risk control
 - **Sliding window, not fixed delays.** `CONFIG.RATE_WINDOW_MS` / `RATE_MAX` (~3 req / 10s) throttle **all** of mymblog / searchProfile / modifyVisible via one global `rateLimiter.acquire(signal)`. Fixed delays triggered HTTP 414 /「频次过快」(commits `b2c4ecb`, `40ea1be`). New network calls must `acquire()` first.
 - RISK → pause `RATE_LIMITED_WAIT_MS` (30s); other API errors → exponential backoff; AUTH → abort. Do not collapse RISK and non-RISK into the same branch.
+- 业务**永久拒绝**（`modifyVisible` 400 + 「暂不支持变更可见范围」，响应体字段 `message` 非 `msg`）→ `PERM` 码：单条只发 1 次请求、计 1 次失败，不进退避重试；失败详情 `console.error("[wbl] ...")` 输出 DevTools（2026-08-29 实测，见 API 笔记第 3 节）。
 
 ### API contracts
 | Call | Path | Notes |
