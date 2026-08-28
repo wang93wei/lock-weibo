@@ -52,7 +52,7 @@ Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** 
 | Call | Path | Notes |
 |---|---|---|
 | List (recent/mid) | `GET /ajax/statuses/mymblog` | page + `since_id`; ~20/page fixed |
-| List (date/before) | `GET /ajax/statuses/searchProfile` | server-side time filter; **`page`/`max_id`/`since_id` ignored** — paginate by shrinking `endtime` to oldest item's `created_at` |
+| List (date/before) | `GET /ajax/statuses/searchProfile` | server-side time filter; paginate by shrinking `endtime` to oldest item's `created_at` (cursor walk, `page` pinned to 1 — page-param behavior drifts: ignored 2026-07-27, honored again 2026-08-29; do not rely on `page`) |
 | Lock | `POST /ajax/statuses/modifyVisible` | form body `ids=<mid>&visible=1` (`visible` is **string** `"1"`) |
 
 - **Headers:** `x-xsrf-token` (cookie `XSRF-TOKEN`), `x-requested-with`, plus mirror weibo-pro-next: `client-version` / `server-version` (from `window.$VERSION`) / `traceparent`. `credentials:"include"`. Do **not** set forbidden headers (cookie/UA/referer).

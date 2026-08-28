@@ -162,7 +162,7 @@ Body: ids=<mid>&visible=1
 ```
 GET https://weibo.com/ajax/statuses/searchProfile
   ?uid=<uid>
-  &page=1                 # ⚠️ 实测恒为 1，page 参数被忽略（见下「分页」）
+  &page=1                 # ⚠️ page 行为有漂移：2026-07-27 实测被忽略；2026-08-29 复测已生效（见下「分页」）
   &endtime=<unix秒>       # 含，+0800 时区；推进游标靠缩小它
   [&starttime=<unix秒>]   # 可选，省略 = 不设下界（实测可工作）
   [&hasori=1&hasret=1&hastext=1&haspic=1&hasvideo=1&hasmusic=1]
@@ -195,6 +195,16 @@ Header: x-xsrf-token: <XSRF-TOKEN>
 三个参数全部被服务端忽略**——实测对同一宽窗口（uid=1238726882，2025 H1，total=134）
 分别请求 `page=1/2/3`、`&max_id=<最旧mid>`、`&since_id=<最旧mid>`，六次返回的
 50 条 mid 序列**逐字节相同**，`total` 也基本不变。
+
+- **⚠️ page 行为已漂移（2026-08-29 复测，chrome-devtools 登录页只读探测）**：
+  同一账号窗口 2025-08-18 ~ 2026-05-29（total=231）实测 `page=1..5` 连续切分
+  **无重无漏**（5 页 50+50+50+50+31，唯一 mid 数 231 == total，跨页 0 重复，
+  时间序新→旧严格递减），`page=6` 与越界 `page=10` 返回空（`total=0, list=[]`）。
+  即 2026-07-27 的「page 被忽略」结论**已过期**，服务端现在支持 page 翻页
+  （`max_id`/`since_id` 本次未复测）。**工程结论不变**：锁脚本继续用 endtime
+  游标走法（固定 `page=1`）——它对「page 生效/被忽略」两种服务端行为都正确，
+  免疫漂移；page 翻页虽已生效但无请求优势（仍是每 50 条 1 次请求），且一旦
+  再漂回忽略行为会造成同页反复拉取、静默漏锁。
 
 → **唯一能推进游标的是缩小 `endtime`**：取本页**最旧一条**的 `created_at`
 转 Unix 秒，作为下一页的 `endtime`，`page` 恒为 1，循环直到取空。
