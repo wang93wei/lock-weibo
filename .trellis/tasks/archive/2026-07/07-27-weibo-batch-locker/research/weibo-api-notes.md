@@ -205,6 +205,19 @@ Header: x-xsrf-token: <XSRF-TOKEN>
   游标走法（固定 `page=1`）——它对「page 生效/被忽略」两种服务端行为都正确，
   免疫漂移；page 翻页虽已生效但无请求优势（仍是每 50 条 1 次请求），且一旦
   再漂回忽略行为会造成同页反复拉取、静默漏锁。
+- **⚠️ page 翻页有「单次查询 ~1000 条」深度上限（2026-08-29 二次复测实锤）**：
+  4847 条大窗口用 page 翻页，第 1~21 页正常（末页 14 条，累计 1010 条），第 22 页
+  起 `total=0, list=[]`——**page 越界 ≠ 真到底**。把 endtime 游标收缩到已取最旧
+  一条（含边界）后，新窗口第 1 页立刻又能取到 50 条更深历史（实测 49/50 条为新），
+  且新窗口内 page 翻页仍可用。**结论：大窗口全量必须 endtime 游标分轮，page 只能
+  做窗口内加速**；这也解释了 total 饱和值 ~1007 的来源——它就是单查询深度上限本身。
+- **⚠️ searchProfile 索引覆盖不全（2026-08-29 实测，本账号 uid=1238726882）**：
+  mymblog 报 total ≈8270（逐请求抖动 8238/8270/8269），searchProfile 游标分轮走法
+  只收到 **4821 条**、在 ~2010-04 见底（其 total 也只报 ~4800）——**差的 ~3400 条
+  老微博 searchProfile 索引覆盖不到/不稳定**（控制变量排除 starttime/has* 因素：
+  同一 2010-03 窗口带全参数在浏览器里又能返回 361 条，服务端多索引不一致）。
+  **全量场景必须 mymblog 兜底**：mymblog ~20 条/页、**page 可冷跳**（实测 page=245
+  →2010-10、page=400→2010-03 直接可用），空页 = 到底。
 
 → **唯一能推进游标的是缩小 `endtime`**：取本页**最旧一条**的 `created_at`
 转 Unix 秒，作为下一页的 `endtime`，`page` 恒为 1，循环直到取空。
@@ -225,6 +238,11 @@ Header: x-xsrf-token: <XSRF-TOKEN>
   - 若用 `hits.length >= total` 早停，扫描会在 ~1000 条处截断，更早历史全部漏扫。
 - 同秒碰撞兜底：维护 `seenMids = new Set()`，若某页**无任何新 mid**（全是已见过的）
   则判定到底，避免死循环。
+- **⚠️ 中途短页 ≠ 最后一页（2026-08-29 复测）**：4677 条的大窗口实测第 3 页只回
+  **47** 条（<50），第 4 页继续正常回 50 条——不能用「本页不满 50」判定末页提前
+  停止，必须靠空页终止（越界页返回 `total=0, list=[]`）。同窗口 `total` 还在
+  4677~4845 间逐请求抖动，再次佐证其不可用作控制流。另实测加/不加 `starttime`
+  （2009-08-14 vs 省略）返回的 mid 序列逐条相同，下界只影响查询语义不影响结果。
 - 终止条件（2026-08-29 修订）：`list.length === 0`、本页无新 mid、游标低于 `starttime`
   （`nextEnd == starttime` 时要继续走，覆盖起点秒被分页边界切开的同秒组）、
   或达 `MAX_PAGES_FALLBACK` 上限。**不含** `hits >= total`。
@@ -288,9 +306,42 @@ headers['server-version'] = window.$VERSION.SERVER
 **不要**手动设置（Fetch forbidden / 浏览器自动带）：`cookie`、`user-agent`、`referer`、
 `sec-fetch-*`、`accept-language`。同源 `credentials:"include"` 即可。
 
+**版本值漂移（2026-08-29 复测）**：`window.$VERSION` 现为
+`{ CLIENT: 'v1.1.243', SERVER: 'v2026.08.27.1' }`——CLIENT 从三段式 `3.0.0` 改为
+`vX.Y.NNN` 格式。脚本运行时实时读 `$VERSION` 不受影响；仅硬编码 fallback 常量
+（`3.0.0` / `v2026.07.23.1`）已过期，抓包复用时需同步。
+
 不必模拟 `/ajax/log/action` 埋点请求（那是前端打点，不是业务鉴权依赖）。
 
-## 8. 参考资料
+## 8. 删除接口 destroy（2026-08-29 实测，bundle 源码 + 安全探测）
+
+对「暂不支持变更可见范围」（PERM）的微博，modifyVisible 永久拒绝，但删除走独立接口。
+官方前端（weibo-pro-next bundle `index-CrmZ_Ne1.js`，4 处调用一致）真实实现：
+
+```js
+this.$http.post("/ajax/statuses/destroy", { id: this.data.idstr })  // id = 字符串 idstr
+// 成功判定：resp.ok > 0（与 modifyVisible 相同）
+```
+
+**本任务调用契约（探测验证）**
+```
+POST https://weibo.com/ajax/statuses/destroy
+Content-Type: application/json          # ⚠️ 必须 JSON；表单编码会被网关直接 400（HTML 错误页）
+Header: x-xsrf-token / x-requested-with / client-version / server-version（对齐 axios 拦截器）
+Body: {"id": "<idstr>"}
+```
+- 探测（id="1" 不存在的微博，无副作用）：HTTP 200 `{"ok":0,"message":"该微博不存在","error_code":20101}`
+  —— 证明路由/参数名/JSON 编码/鉴权全部正确；业务错误走 JSON + `message` 字段。
+- **删除不可逆**（对比：仅自己可见 1↔0 可恢复）。除非用户明确确认，工具不得默认启用删除兜底。
+- **PERM 微博可删已一手验证（2026-08-29）**：实测删除 idstr=1315558541（2010-07-25 转发，
+  `visible.type=0`，modifyVisible 报「暂不支持变更可见范围」）——首次调用 HTTP 200
+  返回被删微博完整对象；二次调用返回 `{"ok":0,"message":"该微博不存在","error_code":20101}`。
+- **⚠️ 老帖 `id` ≠ `mid`**：2010 年代老帖 idstr=1315558541 而 mid=20110072529369342（18 位）。
+  `destroy` / `modifyVisible` 均应传 **idstr**。userscript 的 `String(blog.mid || blog.id)`
+  对老帖会传 mid，存在隐患（modifyVisible 是否接受 mid 未实测）；Python 脚本用
+  `blog['id']`（idstr）实测全量可用。
+
+## 9. 参考资料
 
 - 微博客服「微博可见性变更功能相关问题」https://kefu.weibo.com/faqdetail?id=21092
 - 第三方实现（部分描述与现网不符，仅供对照）https://github.com/ByteRax/WeiBoHideTool

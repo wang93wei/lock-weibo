@@ -52,11 +52,13 @@ Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** 
 | Call | Path | Notes |
 |---|---|---|
 | List (recent/mid) | `GET /ajax/statuses/mymblog` | page + `since_id`; ~20/page fixed |
-| List (date/before) | `GET /ajax/statuses/searchProfile` | server-side time filter; paginate by shrinking `endtime` to oldest item's `created_at` (cursor walk, `page` pinned to 1 — page-param behavior drifts: ignored 2026-07-27, honored again 2026-08-29; do not rely on `page`) |
-| Lock | `POST /ajax/statuses/modifyVisible` | form body `ids=<mid>&visible=1` (`visible` is **string** `"1"`) |
+| List (date/before) | `GET /ajax/statuses/searchProfile` | server-side time filter; cursor rounds via shrinking `endtime` to oldest item's `created_at` are MANDATORY — single query has a ~1000-item depth cap (page honored 2026-08-29 but caps out at ~21 pages; ignored entirely 2026-07-27; never rely on `page` for depth). Index may not cover deep history (bottomed ~4821 items / ~2010-04 vs mymblog total ~8270) → mymblog sweep fallback |
+| Lock | `POST /ajax/statuses/modifyVisible` | form body `ids=<idstr>&visible=1` (`visible` is **string** `"1"`) |
+| Delete | `POST /ajax/statuses/destroy` | **JSON** body `{"id":"<idstr>"}` (JSON ONLY — form-encoded gets a plain gateway 400); irreversible, opt-in PERM fallback; PERM-rejected posts ARE deletable (verified 2026-08-29) |
 
 - **Headers:** `x-xsrf-token` (cookie `XSRF-TOKEN`), `x-requested-with`, plus mirror weibo-pro-next: `client-version` / `server-version` (from `window.$VERSION`) / `traceparent`. `credentials:"include"`. Do **not** set forbidden headers (cookie/UA/referer).
 - **Response `visible`:** object `{ type, list_id }`, not a number. `isPrivate` uses `Number(blog.visible.type) === 1` (number **or** string `"1"`).
+- **Canonical id = `idstr`.** 2010-era posts have `id ≠ mid` (idstr `1315558541` vs mid `20110072529369342`); `modifyVisible`/`destroy` take the idstr — use the `statusId()` helper, never `blog.mid` for operations (modern posts: id == idstr == mid).
 
 ### Filter / flow semantics
 - **最近 N 条:** newest-first continuous scan across pages; stop when hits (including already-private skips) reach N. **Never** per-page `slice(0, n)`.
@@ -67,8 +69,10 @@ Batch-set own weibo posts to「仅自己可见」(`visible.type=1`). **Single** 
 
 ### Safety & UX
 - Dry-run default; real run needs second `confirm()`. Thread `AbortController` through every async path (Stop mid-scan).
+- **PERM→删除兜底 (v0.7.0):** panel checkbox「删除兜底」default OFF; when ON, modifyVisible PERM-rejected posts are deleted via `destroy` (irreversible — confirm dialog carries a loud warning; deleted mids get `isPrivate = true` so a second「执行」won't re-hit them).
+- **searchProfile 索引见底 → mymblog 兜底 (v0.7.0):** time-filter previews that stop before reaching `starttime` automatically sweep mymblog (start page = scanned/20 − 30 margin, page cold-jump OK, empty page = account bottom).
 - Tight await-loops must `await yieldToRender()` or the panel freezes while requests still fire.
-- **Version sync:** bump **both** `// @version` header **and** `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.6.7`).
+- **Version sync:** bump **both** `// @version` header **and** `<small>vX.X.X</small>` in `BUILD_PANEL_HTML` (currently `0.7.0`).
 - **searchProfile 终止条件:** `data.total` 大窗口下饱和不可信（~1000±10，与窗口内容脱钩），禁做终止条件；游标**含边界**推进（`curEnd = oldestEpoch`）+ `seenMids` 去重，`-1` 不含边界会丢跨分页边界的同秒帖（2026-08-29 实测，见 API 笔记第 6 节）。
 
 ## Conventions
