@@ -1,0 +1,3 @@
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"检查版本、游标、UID、错误处理与人工验证基线"}
+{"file":".trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md","reason":"核对并发改造未改变 API 契约和终止正确性"}
+{"file":".trellis/tasks/08-31-simplify-weibo-locking-flow/research/python-userscript-concurrency-comparison.md","reason":"核对默认 3 并发、15 次/10 秒及 mymblog 串行决策"}

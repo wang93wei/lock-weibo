@@ -1,0 +1,5 @@
+{"file":".trellis/spec/frontend/quality-guidelines.md","reason":"单 userscript 质量约定、版本同步、searchProfile 终止语义与人工验证要求"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"新增并发 helper 与配置前复用现有模式，避免重试和状态逻辑复制"}
+{"file":".trellis/spec/guides/third-party-api-verification-guide.md","reason":"微博私有 API 不得凭记忆修改契约"}
+{"file":".trellis/tasks/archive/2026-07/07-27-weibo-batch-locker/research/weibo-api-notes.md","reason":"四个 endpoint、限流、分页漂移、idstr、PERM 与 destroy 的一手契约"}
+{"file":".trellis/tasks/08-31-simplify-weibo-locking-flow/research/python-userscript-concurrency-comparison.md","reason":"Python 参考并发证据与本次用户决策"}

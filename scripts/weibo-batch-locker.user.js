@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.7.0
+// @version      0.8.0
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
@@ -49,11 +49,15 @@
   // ===========================================================================
   const CONFIG = {
     PAGE_SIZE: 20, // mymblog returns ~20 per page
-    // Sliding-window rate limiter (global, covers both mymblog + modifyVisible).
+    CONCURRENCY: 3, // searchProfile page waves + lock worker pool (UI: 1~3)
+    SEARCH_PAGES_PER_WINDOW: 30, // searchProfile pages per endtime window
+    // Sliding-window rate limiter (global, covers all four API endpoints).
     // Allows at most RATE_MAX requests within any RATE_WINDOW_MS window.
-    // Default ~3 req / 10s ≈ one request every ~3.3s on average.
+    // 15/10s is proven by the Python reference only; Tampermonkey still needs
+    // a logged-in live verification. RISK responses keep the 30s pause below.
     RATE_WINDOW_MS: 10000,
-    RATE_MAX: 3,
+    RATE_MAX: 15,
+    RUM_SUPPRESSION_GRACE_MS: 3000, // operation finish -> resume APM payloads
     DEFAULT_DELAY_SEC: 1.5, // legacy: min gap hint (window already enforces pacing)
     RATE_LIMITED_WAIT_MS: 30000, // pause length when weibo itself rate-limits us
     MAX_RETRY: 3, // retries per weibo on transient errors
@@ -71,6 +75,67 @@
     10: "粉丝可见",
     3: "付费会员可见",
   };
+
+  // Elastic APM 的 payload filter 只能注册、不能移除，因此每个 agent 只注册一次，
+  // 再用共享计数与截止时间控制是否丢弃。该机制仅 best-effort 抑制操作相关 RUM，
+  // 不改写 Fetch/XHR，也不参与四个业务接口的限流。
+  const rumSuppressionState = {
+    activeCount: 0,
+    graceUntil: 0,
+    registeredAgents: new WeakSet(),
+  };
+  let rumSuppressionNoticeShown = false;
+
+  /**
+   * Temporarily drop Elastic APM RUM payloads. The returned release is
+   * synchronous and idempotent, and deliberately independent of AbortSignal.
+   */
+  function beginRumSuppression() {
+    const apm = window.elasticApm;
+    const canTrackAgent =
+      (typeof apm === "object" && apm !== null) || typeof apm === "function";
+    if (!canTrackAgent) return () => {};
+
+    if (!rumSuppressionState.registeredAgents.has(apm)) {
+      if (typeof apm.addFilter !== "function") return () => {};
+      // Mark before calling: even a throwing agent is attempted at most once.
+      // This filter is best-effort; registration failure must stay a no-op.
+      rumSuppressionState.registeredAgents.add(apm);
+      try {
+        apm.addFilter((payload) => {
+          if (
+            rumSuppressionState.activeCount > 0 ||
+            Date.now() < rumSuppressionState.graceUntil
+          ) {
+            return false;
+          }
+          return payload;
+        });
+      } catch (_) {
+        return () => {};
+      }
+    }
+
+    rumSuppressionState.activeCount++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      rumSuppressionState.activeCount = Math.max(0, rumSuppressionState.activeCount - 1);
+      rumSuppressionState.graceUntil = Math.max(
+        rumSuppressionState.graceUntil,
+        Date.now() + CONFIG.RUM_SUPPRESSION_GRACE_MS
+      );
+    };
+    release.enabled = true;
+    return release;
+  }
+
+  function logRumSuppressionNotice(onLog, release) {
+    if (!release.enabled || rumSuppressionNoticeShown) return;
+    rumSuppressionNoticeShown = true;
+    onLog("已临时抑制微博 RUM 上报（best-effort），操作完成 3 秒后自动恢复。", "muted");
+  }
 
   // ===========================================================================
   // Utils
@@ -252,7 +317,7 @@
 
   /**
    * Sliding-window rate limiter. Throttles ALL outbound weibo requests
-   * (mymblog pagination + modifyVisible) so that at most `max` requests happen
+   * (mymblog/searchProfile/modifyVisible/destroy) so that at most `max` requests happen
    * within any trailing `windowMs` window. This mirrors how platforms actually
    * detect abuse (request density over time), which fixed inter-request delays
    * only approximate.
@@ -559,17 +624,14 @@
    * via searchProfile. Returns data.data. Used by "时间预设"/"日期范围" filters
    * to avoid the cost of full-timeline pagination that mymblog would require.
    *
-   * NOTE on pagination (verified 2026-07-27): `page`, `max_id`, `since_id` are
-   * ALL ignored by this endpoint — only `endtime` moves the cursor (results are
-   * newest-first; callers shrink `endtime` to the oldest item's created_at to
-   * fetch the next slice). `page` is therefore pinned to 1 here; the loop lives
-   * in runApiModeSearchProfile. `Referer` is validated server-side but the
-   * browser sets it automatically for same-origin fetch, so nothing extra is
-   * needed vs fetchBlogPage.
+   * `page` behavior drifts: it was ignored on 2026-07-27 and worked again on
+   * 2026-08-29. Callers probe it and fall back to page=1 + inclusive endtime
+   * cursor when ignored. `Referer` is validated server-side but the browser
+   * sets it automatically for same-origin fetch, so nothing extra is needed.
    */
-  async function fetchSearchProfilePage({ uid, starttime, endtime }, signal) {
+  async function fetchSearchProfilePage({ uid, starttime, endtime, page }, signal) {
     await rateLimiter.acquire(signal); // global sliding-window throttle
-    const params = new URLSearchParams({ uid, page: "1" });
+    const params = new URLSearchParams({ uid, page: String(page) });
     if (starttime) params.set("starttime", String(starttime));
     if (endtime) params.set("endtime", String(endtime));
     const url = `https://weibo.com/ajax/statuses/searchProfile?${params.toString()}`;
@@ -899,7 +961,10 @@
    * parity with runApiMode.
    *
    * Pagination (re-verified 2026-08-29 via live searchProfile):
-   *   - page/max_id/since_id are ignored; shrink `endtime` to walk older.
+   *   - `page` currently works but has drifted before. Fetch bounded page waves
+   *     and compare page 1/2 id sequences; if they match, fall back to page=1.
+   *   - A single query bottoms out around 1000 items, so every page window still
+   *     shrinks `endtime` inclusively to walk deeper history.
    *   - data.total 不可信（2026-08-29 实测）：大时间窗下是饱和近似值（~1000±10，
    *     数值还会抖动），与窗口真实命中数脱钩（实测仅 47 条的窗口报 total=1007；
    *     按相同游标走法收出 1242+ 条唯一 mid 仍未到底，total 仍报 1007）。禁止用
@@ -917,6 +982,7 @@
    * @param {string}  opts.uid
    * @param {number}  [opts.starttime]  unix sec; omit = no lower bound
    * @param {number}  opts.endtime      unix sec
+   * @param {number}  opts.concurrency  page-wave size (1~3)
    * @param {function} opts.onLog
    * @param {function} opts.onProgress
    * @param {AbortSignal} opts.signal
@@ -924,10 +990,14 @@
    */
   async function runApiModeSearchProfile(opts) {
     const { uid, starttime, endtime, onLog, onProgress, signal } = opts;
+    const concurrency = Math.max(1, Math.min(CONFIG.CONCURRENCY, Math.floor(opts.concurrency) || CONFIG.CONCURRENCY));
     const stats = { success: 0, skipped: 0, failed: 0, deleted: 0, scanned: 0, hits: [] };
     const seenMids = new Set();
     let curEnd = endtime;
-    let slice = 0;
+    let windowNo = 0;
+    let fetchedPages = 0;
+    let pageMode = "unknown"; // unknown | active | ignored (for this scan only)
+    let probePageOneIds = null;
     let coveredToStart = false; // 游标是否已越过 starttime（真覆盖完，无需兜底）
 
     onLog(
@@ -936,90 +1006,182 @@
       "info"
     );
 
-    while (slice < CONFIG.MAX_PAGES_FALLBACK) {
-      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-      slice++;
-
-      // Fetch this time slice, retrying on rate-limit with a long pause.
-      let pageData = null;
+    /** One searchProfile page with the existing page-level RISK retry policy. */
+    async function fetchWindowPage(page) {
       for (let attempt = 1; attempt <= CONFIG.MAX_PAGE_RETRY; attempt++) {
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         try {
-          pageData = await fetchSearchProfilePage({ uid, starttime, endtime: curEnd }, signal);
-          break;
+          return await fetchSearchProfilePage({ uid, starttime, endtime: curEnd, page }, signal);
         } catch (err) {
-          if (err.name === "AbortError") throw err;
-          if (err.code === "AUTH") throw err;
+          if (err.name === "AbortError" || err.code === "AUTH") throw err;
           if (err.code === "RISK" && attempt < CONFIG.MAX_PAGE_RETRY) {
             onLog(
-              `第 ${slice} 段被限流: ${err.message}，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
+              `searchProfile 第 ${windowNo} 轮第 ${page} 页被限流: ${err.message}，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
               "warn"
             );
             await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
             continue;
           }
-          onLog(`第 ${slice} 段拉取失败: ${err.message}，终止扫描。`, "error");
-          pageData = null;
+          throw err;
+        }
+      }
+      throw new Error(`searchProfile 第 ${windowNo} 轮第 ${page} 页超过重试上限`);
+    }
+
+    let searchFailed = false;
+    while (fetchedPages < CONFIG.MAX_PAGES_FALLBACK) {
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      windowNo++;
+      let pageStart = 1;
+      let windowNewCount = 0;
+      let windowOldestEpoch = null;
+      let windowHadRawItems = false;
+
+      while (
+        pageStart <= CONFIG.SEARCH_PAGES_PER_WINDOW &&
+        fetchedPages < CONFIG.MAX_PAGES_FALLBACK
+      ) {
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+        // page 被忽略后，每个 endtime 窗口只发 page=1；否则固定波次最多 N 页。
+        const pages = [];
+        if (pageMode === "ignored") {
+          pages.push(1);
+        } else {
+          const remainingInWindow = CONFIG.SEARCH_PAGES_PER_WINDOW - pageStart + 1;
+          const remainingOverall = CONFIG.MAX_PAGES_FALLBACK - fetchedPages;
+          const waveSize = Math.min(concurrency, remainingInWindow, remainingOverall);
+          for (let offset = 0; offset < waveSize; offset++) pages.push(pageStart + offset);
+        }
+        fetchedPages += pages.length;
+
+        // 波次大小已由 pages 限制；allSettled 确保 AUTH/Abort 前已启动页全部收尾。
+        const settled = await Promise.allSettled(
+          pages.map(async (page) => {
+            try {
+              return { page, data: await fetchWindowPage(page) };
+            } catch (err) {
+              err.wblPage = page;
+              throw err;
+            }
+          })
+        );
+
+        const rejected = settled.filter((result) => result.status === "rejected");
+        if (rejected.length) {
+          const fatal = rejected.find(
+            (result) => result.reason?.name === "AbortError" || result.reason?.code === "AUTH"
+          );
+          if (fatal) throw fatal.reason;
+          for (const result of rejected) {
+            const page = result.reason?.wblPage || "?";
+            onLog(
+              `searchProfile 第 ${windowNo} 轮第 ${page} 页拉取失败: ${result.reason?.message || result.reason}，终止扫描。`,
+              "error"
+            );
+          }
+          searchFailed = true;
           break;
         }
-      }
-      if (!pageData) break;
 
-      const list = pageData.list || [];
-      if (list.length === 0) {
-        onLog(`已扫描全部微博（第 ${slice} 段为空），结束。`, "info");
-        break;
-      }
+        const pageResults = settled
+          .map((result) => result.value)
+          .sort((a, b) => a.page - b.page);
 
-      await yieldToRender();
-
-      // Process only mids not seen in a prior slice.
-      let newCount = 0;
-      let oldestEpoch = null;
-      for (const blog of list) {
-        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-        await yieldToRender();
-
-        const mid = statusId(blog);
-        // Track the oldest (smallest epoch) seen this slice for cursor advance.
-        const t = parseWeiboDate(blog.created_at);
-        const epoch = t ? Math.floor(t.getTime() / 1000) : null;
-        if (epoch != null && (oldestEpoch == null || epoch < oldestEpoch)) oldestEpoch = epoch;
-
-        if (seenMids.has(mid)) continue; // already collected in an earlier slice
-        seenMids.add(mid);
-        newCount++;
-        stats.scanned++; // unique mids only — do not count boundary re-fetches
-
-        const day = toDayStr(t);
-        const preview = {
-          mid,
-          date: day,
-          visible: visibleText(blog),
-          isPrivate: isPrivate(blog),
-          text: (blog.text_raw || "").slice(0, 40),
-        };
-        stats.hits.push(preview);
-
-        if (isPrivate(blog)) {
-          stats.skipped++;
-          // 已锁定的不刷屏：前 3 条 + 每 50 条打一次进度
-          if (stats.skipped <= 3 || stats.skipped % 50 === 0) {
-            onLog(`跳过已锁定 ${stats.skipped} 条（最近 [${mid}] ${day}）`, "muted");
+        // 首次拿到 page 1/2 后只判断一次。两页非空且 id 序列完全相同，说明
+        // 服务端又忽略了 page；当前波次只消费 page 1，后续窗口固定 page=1。
+        if (pageMode === "unknown") {
+          const pageOne = pageResults.find((result) => result.page === 1);
+          if (pageOne) probePageOneIds = (pageOne.data.list || []).map(statusId);
+          const pageTwo = pageResults.find((result) => result.page === 2);
+          if (pageTwo && probePageOneIds != null) {
+            const pageTwoIds = (pageTwo.data.list || []).map(statusId);
+            const sameIds =
+              probePageOneIds.length > 0 &&
+              probePageOneIds.length === pageTwoIds.length &&
+              probePageOneIds.every((id, index) => id === pageTwoIds[index]);
+            pageMode = sameIds ? "ignored" : "active";
+            onLog(
+              sameIds
+                ? "检测到 searchProfile 忽略 page，本次扫描已退回 page=1 时间游标模式。"
+                : "searchProfile 多页序列不同，启用有界页波次扫描。",
+              sameIds ? "warn" : "muted"
+            );
           }
-        } else {
-          onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
         }
-        onProgress({ ...stats });
+
+        // 游标必须看本波全部原始返回项（包括边界重复项），不能只看新 mid。
+        let waveRawCount = 0;
+        for (const result of pageResults) {
+          for (const blog of result.data.list || []) {
+            waveRawCount++;
+            windowHadRawItems = true;
+            const t = parseWeiboDate(blog.created_at);
+            const epoch = t ? Math.floor(t.getTime() / 1000) : null;
+            if (epoch != null && (windowOldestEpoch == null || epoch < windowOldestEpoch)) {
+              windowOldestEpoch = epoch;
+            }
+          }
+        }
+
+        // page 被忽略的探测波只消费 page 1；concurrency=1 时 page 1 已在前一波消费，
+        // 当前 page 2 波自然不再消费。seenMids 仍是跨页/跨窗口的最终防线。
+        const consumableResults =
+          pageMode === "ignored"
+            ? pageResults.filter((result) => result.page === 1)
+            : pageResults;
+        let waveNewCount = 0;
+        await yieldToRender();
+        for (const result of consumableResults) {
+          for (const blog of result.data.list || []) {
+            if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+            await yieldToRender();
+
+            const mid = statusId(blog);
+            if (seenMids.has(mid)) continue;
+            seenMids.add(mid);
+            waveNewCount++;
+            windowNewCount++;
+            stats.scanned++; // unique mids only — do not count boundary re-fetches
+
+            const t = parseWeiboDate(blog.created_at);
+            const day = toDayStr(t);
+            const preview = {
+              mid,
+              date: day,
+              visible: visibleText(blog),
+              isPrivate: isPrivate(blog),
+              text: (blog.text_raw || "").slice(0, 40),
+            };
+            stats.hits.push(preview);
+
+            if (isPrivate(blog)) {
+              stats.skipped++;
+              if (stats.skipped <= 3 || stats.skipped % 50 === 0) {
+                onLog(`跳过已锁定 ${stats.skipped} 条（最近 [${mid}] ${day}）`, "muted");
+              }
+            } else {
+              onLog(`待锁 [${mid}] ${day} (${visibleText(blog)}) ${(blog.text_raw || "").slice(0, 20)}`, "hit");
+            }
+            onProgress({ ...stats });
+          }
+        }
+
+        if (pageMode === "ignored") break;
+        if (waveRawCount === 0 || waveNewCount === 0) break;
+        pageStart += pages.length;
       }
 
-      if (newCount === 0) {
-        // Every item this slice was already seen → stop (no progress).
-        onLog(`本段无新微博（已全部覆盖），结束扫描。`, "info");
+      if (searchFailed) break;
+      if (!windowHadRawItems) {
+        onLog(`searchProfile 第 ${windowNo} 轮为空，结束时间索引扫描。`, "info");
         break;
       }
-
-      if (oldestEpoch == null) {
+      if (windowNewCount === 0) {
+        onLog(`searchProfile 本轮无新微博（已全部覆盖），结束时间索引扫描。`, "info");
+        break;
+      }
+      if (windowOldestEpoch == null) {
         onLog(`无法继续推进时间游标，结束扫描。`, "info");
         break;
       }
@@ -1029,7 +1191,7 @@
       // 重复收集，stats.scanned 本来就只计新 mid）。代价是每段最多多带 1-2 条
       // 已见条目；窗口取空后由空列表或上面 newCount===0 终止，最多多花一次
       // 收尾请求，正确性优先。
-      const nextEnd = oldestEpoch;
+      const nextEnd = windowOldestEpoch;
       if (nextEnd > curEnd) {
         onLog(`无法继续推进时间游标，结束扫描。`, "info");
         break;
@@ -1042,6 +1204,10 @@
         break;
       }
       curEnd = nextEnd;
+    }
+
+    if (!searchFailed && fetchedPages >= CONFIG.MAX_PAGES_FALLBACK && !coveredToStart) {
+      onLog(`searchProfile 已达到 ${CONFIG.MAX_PAGES_FALLBACK} 页安全上限，转入兜底扫描。`, "warn");
     }
 
     // —— mymblog 兜底（2026-08-29 实测）：searchProfile 索引对深历史覆盖不全 ——
@@ -1139,6 +1305,52 @@
   }
 
   /**
+   * Consume a finite list with a fixed number of workers. AUTH stops assigning
+   * new items; Abort also stops the pool. `allSettled` keeps the caller busy
+   * until every worker that was already started has finished unwinding.
+   */
+  async function runWorkerPool(items, concurrency, signal, workerFn) {
+    const workerCount = Math.min(
+      items.length,
+      Math.max(1, Math.min(CONFIG.CONCURRENCY, Math.floor(concurrency) || CONFIG.CONCURRENCY))
+    );
+    let nextIndex = 0;
+    let fatalError = null;
+
+    async function worker() {
+      while (true) {
+        if (fatalError) return;
+        if (signal.aborted) {
+          if (!fatalError) fatalError = new DOMException("Aborted", "AbortError");
+          return;
+        }
+
+        // JS runs this claim synchronously, so workers cannot receive the same item.
+        const index = nextIndex++;
+        if (index >= items.length) return;
+        try {
+          await workerFn(items[index], index);
+        } catch (err) {
+          if (err.name === "AbortError" || err.code === "AUTH") {
+            if (!fatalError) fatalError = err;
+            return;
+          }
+          // Programming/unexpected failures are surfaced after every worker
+          // settles; normal API/RISK/PERM failures are handled inside workerFn.
+          throw err;
+        }
+      }
+    }
+
+    const settled = await Promise.allSettled(
+      Array.from({ length: workerCount }, () => worker())
+    );
+    if (fatalError) throw fatalError;
+    const rejected = settled.find((result) => result.status === "rejected");
+    if (rejected) throw rejected.reason;
+  }
+
+  /**
    * Lock a list of weibos by mid, reusing the mids gathered during preview
    * (avoids a second pagination sweep — halves request count + rate-limit exposure).
    *
@@ -1152,7 +1364,7 @@
    *
    * @param {Array<{mid:string, isPrivate:boolean, date?:string}>} hits
    */
-  async function lockByIds(hits, { onLog, onProgress, signal, deletePerm }) {
+  async function lockByIds(hits, { onLog, onProgress, signal, deletePerm, concurrency }) {
     const stats = { success: 0, skipped: 0, failed: 0, deleted: 0, scanned: hits.length, hits };
     // 已锁定的只计总数，不进逐条循环（避免千级跳过仍 rAF + onProgress 拖尾）
     const toLock = [];
@@ -1161,14 +1373,14 @@
       else toLock.push(item);
     }
     onLog(
-      `— 执行开始（真实修改），待锁 ${toLock.length} 条` +
+      `— 执行开始（真实修改，并发完成顺序可能不同），待锁 ${toLock.length} 条` +
         (stats.skipped ? `，已锁定跳过 ${stats.skipped} 条` : "") +
         ` —`,
       "info"
     );
     onProgress({ ...stats });
 
-    for (const item of toLock) {
+    async function lockOne(item) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
       await yieldToRender(); // let the browser paint log/counters
       const mid = String(item.mid);
@@ -1208,20 +1420,39 @@
           // 删除兜底（面板显式勾选，不可逆）：改调 destroy 直接删除。
           if (err.code === "PERM") {
             if (deletePerm) {
-              try {
-                onLog(`🗑 不支持变更，改删除 [${mid}] ...`, "warn");
-                await destroyStatus(mid, signal);
-                stats.deleted++;
-                item.isPrivate = true; // 防止二次「执行」再打已删除的 mid
-                onLog(`🗑 已删除 [${mid}] ${day}（不支持变更可见范围，不可恢复）`, "success");
-                done = true;
-              } catch (dErr) {
-                if (dErr.name === "AbortError") throw dErr;
-                if (dErr.code === "AUTH") {
-                  onLog(`鉴权失败，终止: ${dErr.message}`, "error");
-                  throw dErr;
+              // destroy 也是真实请求：RISK 用长暂停，其他 API 错误指数退避。
+              // PERM 只约束 modifyVisible 不重试，不应让可恢复的 destroy 瞬时失败变成永久失败。
+              for (let deleteAttempt = 1; deleteAttempt <= CONFIG.MAX_RETRY; deleteAttempt++) {
+                try {
+                  onLog(`🗑 不支持变更，改删除 [${mid}] 尝试 ${deleteAttempt}/${CONFIG.MAX_RETRY} ...`, "warn");
+                  await destroyStatus(mid, signal);
+                  stats.deleted++;
+                  item.isPrivate = true; // 防止二次「执行」再打已删除的 mid
+                  onLog(`🗑 已删除 [${mid}] ${day}（不支持变更可见范围，不可恢复）`, "success");
+                  done = true;
+                  break;
+                } catch (dErr) {
+                  if (dErr.name === "AbortError") throw dErr;
+                  if (dErr.code === "AUTH") {
+                    onLog(`鉴权失败，终止: ${dErr.message}`, "error");
+                    throw dErr;
+                  }
+                  if (deleteAttempt >= CONFIG.MAX_RETRY) {
+                    onLog(`✗ 删除失败 [${mid}]: ${dErr.message}（已达最大重试）`, "error");
+                    break;
+                  }
+                  if (dErr.code === "RISK") {
+                    onLog(
+                      `删除限流 [${mid}]，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${deleteAttempt}/${CONFIG.MAX_RETRY}）`,
+                      "warn"
+                    );
+                    await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+                    continue;
+                  }
+                  const deleteWait = CONFIG.RETRY_BASE_WAIT_MS * Math.pow(2, deleteAttempt - 1);
+                  onLog(`删除重试 [${mid}] ${dErr.message}，${deleteWait / 1000}s 后重试`, "warn");
+                  await sleep(deleteWait, signal);
                 }
-                onLog(`✗ 删除失败 [${mid}]: ${dErr.message}`, "error");
               }
             } else {
               onLog(`✗ 不支持变更 [${mid}]: ${err.message}（不重试）`, "error");
@@ -1240,6 +1471,8 @@
       // aren't perfectly regular (regularity is itself a bot signal).
       await sleep(randomDelayMs(1.0), signal);
     }
+
+    await runWorkerPool(toLock, concurrency, signal, lockOne);
 
     onLog(
       `完成 — 成功 ${stats.success} · 已删 ${stats.deleted} · 跳过 ${stats.skipped} · 失败 ${stats.failed} · 共 ${stats.hits.length}`,
@@ -1282,6 +1515,7 @@
         mid: $("#wbl-mid-panel"),
         recent: $("#wbl-recent-panel"),
       },
+      concurrency: $("#wbl-concurrency"),
       delay: $("#wbl-delay"),
       previewBtn: $("#wbl-preview"),
       runBtn: $("#wbl-run"),
@@ -1364,13 +1598,31 @@
     beforeMonthsEl.addEventListener("change", refreshBeforeCutoff);
     refreshBeforeCutoff();
 
-    // Rate limit: bind the panel input to the global limiter.
-    function syncRateLimit() {
-      const m = Math.max(1, parseInt(els.delay.value, 10) || CONFIG.RATE_MAX);
-      rateLimiter.setMax(m);
+    // Snapshot runtime knobs once per action; running inputs are disabled, so
+    // page waves / workers cannot change size halfway through an operation.
+    function readRuntimeCfg() {
+      const clampInput = (el, min, max, fallback) => {
+        const parsed = parseInt(el.value, 10);
+        const value = Math.max(min, Math.min(max, Number.isFinite(parsed) ? parsed : fallback));
+        el.value = String(value);
+        return value;
+      };
+      const concurrency = clampInput(els.concurrency, 1, CONFIG.CONCURRENCY, CONFIG.CONCURRENCY);
+      const rateMax = clampInput(els.delay, 1, CONFIG.RATE_MAX, CONFIG.RATE_MAX);
+      rateLimiter.setMax(rateMax);
+      return { concurrency, rateMax };
     }
-    els.delay.addEventListener("change", syncRateLimit);
-    syncRateLimit();
+
+    function logRuntimeCfg(runtimeCfg) {
+      const pendingLiveVerification =
+        runtimeCfg.rateMax === CONFIG.RATE_MAX
+          ? "；15 次额度仅 Python 参考版实测，Tampermonkey 待验证"
+          : "";
+      log(
+        `运行参数：并发上限 ${runtimeCfg.concurrency} · 每 10 秒最多 ${runtimeCfg.rateMax} 次请求${pendingLiveVerification}`,
+        pendingLiveVerification ? "warn" : "info"
+      );
+    }
 
     // logging
     function log(msg, level) {
@@ -1439,12 +1691,16 @@
         log(err, "error");
         return;
       }
+      const runtimeCfg = readRuntimeCfg();
       setMode("previewing");
       state.abortCtrl = new AbortController();
       log("— 预览开始 —", "info");
-      if ($("#wbl-delete-perm").checked)
-        log("⚠ 删除兜底已开启：执行时「不支持变更可见范围」的微博将被直接删除（不可恢复）", "warn");
+      logRuntimeCfg(runtimeCfg);
+      const releaseRumSuppression = beginRumSuppression();
       try {
+        logRumSuppressionNotice(log, releaseRumSuppression);
+        if ($("#wbl-delete-perm").checked)
+          log("⚠ 删除兜底已开启：执行时「不支持变更可见范围」的微博将被直接删除（不可恢复）", "warn");
         let stats;
         if (cfg.type === "date" || cfg.type === "before") {
           // Time-range filters: let the server do the date filtering via
@@ -1463,6 +1719,7 @@
               onLog: log,
               onProgress: setCounts,
               signal: state.abortCtrl.signal,
+              concurrency: runtimeCfg.concurrency,
             };
           } else {
             // "时间预设 N 个月前": lock everything strictly older than cutoff.
@@ -1474,6 +1731,7 @@
               onLog: log,
               onProgress: setCounts,
               signal: state.abortCtrl.signal,
+              concurrency: runtimeCfg.concurrency,
             };
           }
           stats = await runApiModeSearchProfile(spOpts);
@@ -1505,6 +1763,7 @@
         else if (e.code === "AUTH") log(`鉴权错误: ${e.message}（请重新登录）`, "error");
         else log(`预览出错: ${e.message}`, "error");
       } finally {
+        releaseRumSuppression();
         setMode("idle");
       }
     }
@@ -1546,21 +1805,27 @@
         log("已取消执行", "warn");
         return;
       }
+      const runtimeCfg = readRuntimeCfg();
       // Real run: lock by the previewed mids directly (no re-scan).
       setMode("running");
       state.abortCtrl = new AbortController();
+      logRuntimeCfg(runtimeCfg);
+      const releaseRumSuppression = beginRumSuppression();
       try {
+        logRumSuppressionNotice(log, releaseRumSuppression);
         await lockByIds(hits, {
           onLog: log,
           onProgress: setCounts,
           signal: state.abortCtrl.signal,
           deletePerm,
+          concurrency: runtimeCfg.concurrency,
         });
       } catch (e) {
         if (e.name === "AbortError") log("执行已停止（已完成的不会回滚）", "warn");
         else if (e.code === "AUTH") log(`鉴权错误: ${e.message}（请重新登录）`, "error");
         else log(`执行出错: ${e.message}`, "error");
       } finally {
+        releaseRumSuppression();
         setMode("idle");
       }
     }
@@ -1689,7 +1954,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.7.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.8.0</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -1729,10 +1994,17 @@
         </div>
 
         <div class="wbl-section">
+          <span class="wbl-label">并发上限：
+            <input type="number" id="wbl-concurrency" value="3" min="1" max="3" step="1" style="width:50px;display:inline-block;vertical-align:middle">
+            个任务</span>
+          <div class="wbl-hint">用于 searchProfile 页波次与锁定 worker；设为 1 可退化为串行。mymblog 翻页始终串行。</div>
+        </div>
+
+        <div class="wbl-section">
           <span class="wbl-label">请求限速：每 10 秒最多
-            <input type="number" id="wbl-delay" value="3" min="1" max="10" step="1" style="width:50px;display:inline-block;vertical-align:middle">
+            <input type="number" id="wbl-delay" value="15" min="1" max="15" step="1" style="width:50px;display:inline-block;vertical-align:middle">
             次请求</span>
-          <div class="wbl-hint">越小越保守（默认 3 ≈ 每 3.3 秒 1 次）。被风控过就调小到 1~2。</div>
+          <div class="wbl-hint">默认 15 仅 Python 参考版实测，Tampermonkey 待验证。命中风控会暂停 30 秒；可调低额度。</div>
         </div>
 
         <div class="wbl-section">
