@@ -86,3 +86,24 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 4: 微博批量锁 v0.8.0 并发与 RUM 抑制
+
+**Date**: 2026-09-01
+**Task**: 微博批量锁 v0.8.0 并发与 RUM 抑制
+**Branch**: `main`
+
+### Summary
+
+完成 searchProfile 有界页波次、锁定 worker 池、统一 15/10s 滑窗、destroy 瞬时错误重试及操作期 Elastic APM RUM best-effort 抑制；静态与临时 Node VM 验证通过，真实 Tampermonkey/微博 API/RUM 网络仍待人工验证。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9ec441e` | (see git log) |
+
+### Status
+
+[OK] **Completed**
