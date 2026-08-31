@@ -13,7 +13,7 @@ import { createHash } from "crypto"
 import { Buffer, isUtf8 } from "buffer"
 import process from "process"
 
-const PYTHON_CMD = platform() === "win32" ? "python" : "python"
+const PYTHON_CMD = platform() === "win32" ? "python" : "python3"
 // Debug logging
 const DEBUG_LOG = "/tmp/trellis-plugin-debug.log"
 
