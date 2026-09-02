@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.8.0
+// @version      0.8.2
 // @description  在 weibo.com 登录态下，按「最近N条 / 时间预设(1月/3月/半年/1年前) / 发布日期范围 / mid 范围」筛选，批量将自己的微博设为「仅自己可见」(visible.type=1)。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
@@ -1551,7 +1551,7 @@
       return uid;
     }
     refreshUidHint({ quiet: true });
-    onSpaNavigate(() => refreshUidHint());
+    host.addEventListener("wbl:routechange", () => refreshUidHint());
 
     // filter switching
     function currentFilterCfg() {
@@ -1909,6 +1909,8 @@
     .wbl-radios { display: flex; gap: 12px; flex-wrap: wrap; }
     .wbl-radios label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
     .wbl-row { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+    #wbl-recent-n { width: 240px; flex: 0 1 240px; min-width: 0; }
+    #wbl-recent-panel .wbl-hint { flex: 0 0 auto; white-space: nowrap; }
     .wbl-panel input[type=text], .wbl-panel input[type=date], .wbl-panel input[type=number], .wbl-panel select {
       background: #2c313a; border: 1px solid #3a3f4b; color: #e6e6e6;
       border-radius: 5px; padding: 4px 7px; font-size: 12px; width: 100%;
@@ -1954,7 +1956,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.8.0</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.8.2</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -2043,21 +2045,32 @@
   // Bootstrap
   // ===========================================================================
 
+  function isProfilePage() {
+    return /^\/(?:u|profile)\/\d+(?:\/|$)/.test(window.location.pathname);
+  }
+
   function boot() {
-    // Only inject on weibo.com pages where the panel makes sense.
-    // Avoid iframe / login pages.
+    // Only show on personal profile routes; keep tracking SPA route changes.
     if (window.top !== window.self) return;
     if (!/weibo\.com/.test(window.location.hostname)) return;
-    if (/passport|login|sso/i.test(window.location.pathname)) return;
 
-    // SPA: weibo may render body late; wait for it.
-    const tryInject = () => {
-      if (document.body && !document.getElementById(PANEL_ID)) {
+    const syncPanelVisibility = () => {
+      const host = document.getElementById(PANEL_ID);
+      if (!isProfilePage()) {
+        if (host) host.style.display = "none";
+        return;
+      }
+      if (!document.body) return;
+      if (!host) {
         createPanel();
+      } else {
+        host.style.removeProperty("display");
+        host.dispatchEvent(new Event("wbl:routechange"));
       }
     };
-    if (document.body) tryInject();
-    else document.addEventListener("DOMContentLoaded", tryInject, { once: true });
+    onSpaNavigate(syncPanelVisibility);
+    if (document.body) syncPanelVisibility();
+    else document.addEventListener("DOMContentLoaded", syncPanelVisibility, { once: true });
   }
 
   boot();
