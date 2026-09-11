@@ -45,7 +45,7 @@ boot → profile/SPA route gate → createPanel (Shadow DOM)
 - 源码按 `CONFIG`/RUM、身份与动作工具、限流/API、纯筛选器、扫描/执行、Shadow DOM UI、`boot()` 分区。四个端点、四处业务 fetch；`destroyStatus()` 与 `destroyQuickRepost()` 共用 `requestDestroy()`，不是第五个端点。
 - `makePreviewItem()` 统一生成 `lock | cancelQuickRepost | skip` 动作，预览缓存为 `state.lastPreview = {hits, filterCfg, at}`。执行只消费快照，不重新扫描或核验可见性；按 `action` 与 `completed` 统计待办，成功后原地标记完成，不得仅按 `isPrivate` 判断。
 - `runApiModeSearchProfile()` 使用含边界的 `curEnd = oldestEpoch` 和 `seenMids` 去重；不得用饱和且不可靠的 `data.total` 提前终止，也不得把游标减一。索引未覆盖 `starttime` 时必须保留 `mymblog` 补扫。
-- 一个页面级滑动窗口限流器覆盖 `mymblog`、`searchProfile`、`modifyVisible`、`destroy`。一个 action 级 `AbortController` 贯穿限流等待、sleep、fetch、分页和 worker；已完成的服务端修改不回滚。
+- 三个页面级滑动窗口限流桶分管 `mymblog`（严格，页间隙+深页加压）、`searchProfile`（宽松）、`modifyVisible`/`destroy`（写桶固定）。一个 action 级 `AbortController` 贯穿限流等待、sleep、fetch、分页和 worker；已完成的服务端修改不回滚。
 - 状态只存在页面内存：IIFE 全局状态、panel 闭包状态、单次操作局部状态。刷新页面会丢失；没有 `localStorage`、IndexedDB 或 GM 存储。
 - SPA 离开个人页仅隐藏面板，不销毁快照、不自动停止操作。数字个人页路由不证明内容属于登录用户；预览也没有自动过期或账户绑定保证。
 - Elastic APM RUM 抑制是 best-effort payload filter，不拦截业务 fetch；释放逻辑必须留在 `finally`。
@@ -85,7 +85,7 @@ git diff --check
 - 快转由 `isQuickRepost()` 识别，不能与普通转发混同；快转判断先于原帖私密状态。默认跳过，开启取消后必须以 `ori_mid` 作为 `actionId`；缺失时安全跳过，绝不能替换成展示原帖 ID。
 - `destroy` 共用 JSON `{id: String(id)}` 传输，但两个业务封装不可合并：普通删除允许成功响应缺少 `ok`；快转取消必须 HTTP 成功且 JSON `ok > 0`。
 - UID 优先取登录态 `$CONFIG.uid` / `$CONFIG.user.idstr`，个人页 URL 仅兜底；每次预览/执行重新读取。`boot()` 必须继续跟踪 `pushState`、`replaceState`、`popstate`。
-- 四个业务 fetch 前都必须 `await rateLimiter.acquire(signal)`，并继续使用 `credentials: "include"` 与 `apiHeaders()`。新增网络调用必须接入同一限流器和 AbortSignal。
+- 四个业务 fetch 前都必须 `await` 各自限流桶的 `acquire(signal)`（`searchLimiter` / `timelineLimiter` / `writeLimiter`），并继续使用 `credentials: "include"` 与 `apiHeaders()`。新增网络调用必须接入对应桶和 AbortSignal。
 - mutation 先用 `readApiBody()` 保留正文，再分类错误。`AUTH`/Abort 停止派发并等待在途 worker 收尾；`RISK` 在当前请求重试分支按 `RATE_LIMITED_WAIT_MS` 等待，不是全局熔断；网络/5xx 指数退避。普通锁定/快转的 `NOT_OWN` 跳过，`BUSINESS` 当次记失败、后续跳过，不盲目重试。
 - `PERM` 不重试 `modifyVisible`；当前 UI 的 `lockByIds()` 仅对 `action === "lock"` 且开启删除兜底的项目调用 `destroyStatus()`。取消快转失败不得落入删帖兜底。不要把保留的 `runApiMode()` 非 dry-run 分支当成新的 UI 执行入口。
 - 「最近 N 条」按 newest-first 跨页连续计数，已私密项与快转跳过项也占 N。日期复用现有工具，注意浏览器本地时区；QA 覆盖 before 截止日与日期范围两端边界，不假设硬编码北京时间。

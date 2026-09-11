@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.8.3
+// @version      0.8.4
 // @description  在 weibo.com 登录态下按条件批量将自己的微博设为「仅自己可见」，并可选取消筛选范围内的快转。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
@@ -55,15 +55,22 @@
     PAGE_SIZE: 20, // mymblog returns ~20 per page
     CONCURRENCY: 3, // searchProfile page waves + lock worker pool (UI: 1~3)
     SEARCH_PAGES_PER_WINDOW: 30, // searchProfile pages per endtime window
-    // Sliding-window rate limiter (global, covers all four API endpoints).
-    // Allows at most RATE_MAX requests within any RATE_WINDOW_MS window.
-    // 15/10s is proven by the Python reference only; Tampermonkey still needs
-    // a logged-in live verification. RISK responses keep the 30s pause below.
+    // Per-endpoint sliding-window buckets (10s window each,互不挤占).
+    // mymblog 全量时间线分页是限流重灾区（深历史数百页），用严格桶 + 页间隙；
+    // searchProfile 时间索引请求量小，用宽松桶；写操作风控最敏感，固定保守不暴露 UI。
+    // 15/10s 仅 Python 参考版实测，Tampermonkey 待登录态验证。RISK 命中后 search/写
+    // 暂停 RATE_LIMITED_WAIT_MS；mymblog 页级用 PAGE_RISK_WAITS_MS 渐进退避。
     RATE_WINDOW_MS: 10000,
-    RATE_MAX: 15,
+    RATE_MAX_SEARCH: 15, // searchProfile 宽松桶（面板可调 1..15）
+    RATE_MAX_TIMELINE: 8, // mymblog 严格桶（面板可调 1..15）
+    RATE_MAX_WRITE: 10, // modifyVisible/destroy 固定桶（不暴露 UI）
+    MYMBLOG_MIN_GAP_MS: 900, // mymblog 页间最小间隔（可中断 sleep，Abort 透传）
+    MYMBLOG_DEEP_PAGE: 300, // 深页起点：400+ 页不再直冲 414
+    MYMBLOG_DEEP_EXTRA_MS: 600, // 深页追加间隔
     RUM_SUPPRESSION_GRACE_MS: 3000, // operation finish -> resume APM payloads
     DEFAULT_DELAY_SEC: 1.5, // legacy: min gap hint (window already enforces pacing)
-    RATE_LIMITED_WAIT_MS: 30000, // pause length when weibo itself rate-limits us
+    RATE_LIMITED_WAIT_MS: 30000, // search/写命中 RISK 后的暂停长度
+    PAGE_RISK_WAITS_MS: [30000, 60000, 120000], // mymblog 页级 RISK 渐进退避 + ±20% 抖动
     MAX_RETRY: 3, // retries per weibo on transient errors
     MAX_PAGE_RETRY: 3, // retries on a rate-limited page before giving up
     RETRY_BASE_WAIT_MS: 2000, // exponential backoff base
@@ -395,14 +402,22 @@
     return Math.round(baseSec * (0.8 + Math.random() * 0.4) * 1000);
   }
 
+  /** mymblog 页级 RISK 渐进等待：30s→60s→120s + ±20% 抖动。attempt 从 1 起。 */
+  function pageRiskWaitMs(attempt) {
+    const waits = CONFIG.PAGE_RISK_WAITS_MS;
+    const base = waits[Math.min(Math.max(1, attempt), waits.length) - 1];
+    return Math.round(base * (0.8 + Math.random() * 0.4));
+  }
+
   /**
-   * Sliding-window rate limiter. Throttles ALL outbound weibo requests
-   * (mymblog/searchProfile/modifyVisible/destroy) so that at most `max` requests happen
+   * Sliding-window rate limiter factory. Each instance throttles ONE bucket
+   * (searchProfile / mymblog / modifyVisible+destroy) so that at most `max` requests happen
    * within any trailing `windowMs` window. This mirrors how platforms actually
    * detect abuse (request density over time), which fixed inter-request delays
    * only approximate.
    *
-   * Usage: `await rateLimiter.acquire(signal)` before every network call.
+   * Usage: `await searchLimiter.acquire(signal)` (or timeline/write bucket)
+   * before every network call.
    * Returns the ms it waited (0 if no wait).
    */
   function createRateLimiter(windowMs, max) {
@@ -441,8 +456,11 @@
     };
   }
 
-  // Single global limiter instance shared by all requests in this page session.
-  const rateLimiter = createRateLimiter(CONFIG.RATE_WINDOW_MS, CONFIG.RATE_MAX);
+  // Per-endpoint buckets: searchProfile 宽松 / mymblog 严格 / 写操作独立，互不挤占。
+  // 预览期只有读、执行期只有写，同时打满三桶的场景不存在。
+  const searchLimiter = createRateLimiter(CONFIG.RATE_WINDOW_MS, CONFIG.RATE_MAX_SEARCH);
+  const timelineLimiter = createRateLimiter(CONFIG.RATE_WINDOW_MS, CONFIG.RATE_MAX_TIMELINE);
+  const writeLimiter = createRateLimiter(CONFIG.RATE_WINDOW_MS, CONFIG.RATE_MAX_WRITE);
 
   // ===========================================================================
   // API layer
@@ -587,7 +605,11 @@
 
   /** Fetch one page of the user's own weibo timeline. Returns data.data. */
   async function fetchBlogPage({ uid, page, sinceId }, signal) {
-    await rateLimiter.acquire(signal); // global sliding-window throttle
+    await timelineLimiter.acquire(signal); // mymblog 严格桶
+    // 页间最小间隔 + 深页加压（可中断，Abort 透传），避免 400+ 页直冲 414。
+    let gap = CONFIG.MYMBLOG_MIN_GAP_MS;
+    if (page >= CONFIG.MYMBLOG_DEEP_PAGE) gap += CONFIG.MYMBLOG_DEEP_EXTRA_MS;
+    if (gap > 0) await sleep(gap, signal);
     const params = new URLSearchParams({ uid, page: String(page), feature: "0" });
     if (sinceId) params.set("since_id", String(sinceId));
     const url = `https://weibo.com/ajax/statuses/mymblog?${params.toString()}`;
@@ -626,7 +648,7 @@
 
   /** Set one weibo's visibility to "仅自己可见". */
   async function modifyVisible(mid, signal) {
-    await rateLimiter.acquire(signal); // global sliding-window throttle
+    await writeLimiter.acquire(signal); // 写操作独立桶
     const body = new URLSearchParams({ ids: String(mid), visible: "1" });
     const res = await fetch("https://weibo.com/ajax/statuses/modifyVisible", {
       method: "POST",
@@ -648,7 +670,7 @@
 
   /** Shared transport for both /destroy uses; callers own success semantics. */
   async function requestDestroy(id, signal) {
-    await rateLimiter.acquire(signal); // same global sliding-window throttle
+    await writeLimiter.acquire(signal); // 写操作独立桶（普通删除与取消快转共用）
     const res = await fetch("https://weibo.com/ajax/statuses/destroy", {
       method: "POST",
       headers: apiHeaders(true, "application/json;charset=UTF-8"),
@@ -708,7 +730,7 @@
    * sets it automatically for same-origin fetch, so nothing extra is needed.
    */
   async function fetchSearchProfilePage({ uid, starttime, endtime, page }, signal) {
-    await rateLimiter.acquire(signal); // global sliding-window throttle
+    await searchLimiter.acquire(signal); // searchProfile 宽松桶
     const params = new URLSearchParams({ uid, page: String(page) });
     if (starttime) params.set("starttime", String(starttime));
     if (endtime) params.set("endtime", String(endtime));
@@ -854,6 +876,8 @@
       deleted: 0,
       scanned: 0,
       hits: [],
+      incomplete: false, // mymblog 页级 RISK 耗尽时置 true，保留部分预览 + 断点页码
+      resumeMpage: null,
     };
     let privateSkipped = 0;
     let page = 1;
@@ -869,8 +893,9 @@
     while (page <= CONFIG.MAX_PAGES_FALLBACK) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-      // Fetch this page, retrying on rate-limit with a long pause.
+      // Fetch this page, retrying mymblog RISK with progressive backoff.
       let pageData = null;
+      let pageRiskExhausted = false;
       for (let attempt = 1; attempt <= CONFIG.MAX_PAGE_RETRY; attempt++) {
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         try {
@@ -880,19 +905,31 @@
           if (err.name === "AbortError") throw err;
           if (err.code === "AUTH") throw err; // stop everything on auth failure
           if (err.code === "RISK" && attempt < CONFIG.MAX_PAGE_RETRY) {
+            const waitMs = pageRiskWaitMs(attempt);
             onLog(
-              `第 ${page} 页被限流: ${err.message}，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
+              `第 ${page} 页被限流: ${err.message}，暂停 ${Math.round(waitMs / 1000)}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
               "warn"
             );
-            await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+            await sleep(waitMs, signal);
             continue;
           }
+          if (err.code === "RISK") pageRiskExhausted = true;
           onLog(`第 ${page} 页拉取失败: ${err.message}，终止扫描。`, "error");
           pageData = null;
           break;
         }
       }
-      if (!pageData) break;
+      if (!pageData) {
+        if (pageRiskExhausted) {
+          stats.incomplete = true;
+          stats.resumeMpage = page;
+          onLog(
+            `⚠ 时间线扫描在第 ${page} 页被限流中断，已保留部分预览（${stats.hits.length} 条），稍后可重跑继续`,
+            "warn"
+          );
+        }
+        break;
+      }
 
       const list = pageData.list || [];
       if (list.length === 0) {
@@ -1065,7 +1102,7 @@
         break;
       }
       page++;
-      // No extra sleep here: the global rateLimiter inside fetchBlogPage
+      // No extra sleep here: timelineLimiter + 页间隙 inside fetchBlogPage
       // already paces pagination.
     }
 
@@ -1127,6 +1164,8 @@
       deleted: 0,
       scanned: 0,
       hits: [],
+      incomplete: false, // mymblog 补扫被限流中断时置 true，保留部分预览 + 断点页码
+      resumeMpage: null,
     };
     let privateSkipped = 0;
     const seenMids = new Set();
@@ -1366,29 +1405,43 @@
       for (; mpage < CONFIG.MAX_PAGES_FALLBACK; mpage++) {
         if (signal.aborted) throw new DOMException("Aborted", "AbortError");
         let mData = null;
+        let mRiskExhausted = false;
         for (let attempt = 1; attempt <= CONFIG.MAX_PAGE_RETRY; attempt++) {
           if (signal.aborted) throw new DOMException("Aborted", "AbortError");
           try {
             // 不带 since_id 的 page 冷跳（2026-08-29 实测深页可用）
+            // 限流桶 + 页间隙在 fetchBlogPage 内（mymblog 严格桶）。
             mData = await fetchBlogPage({ uid, page: mpage }, signal);
             break;
           } catch (err) {
             if (err.name === "AbortError") throw err;
             if (err.code === "AUTH") throw err;
             if (err.code === "RISK" && attempt < CONFIG.MAX_PAGE_RETRY) {
+              const waitMs = pageRiskWaitMs(attempt);
               onLog(
-                `mymblog 第 ${mpage} 页被限流，暂停 ${CONFIG.RATE_LIMITED_WAIT_MS / 1000}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
+                `mymblog 第 ${mpage} 页被限流，暂停 ${Math.round(waitMs / 1000)}s 后重试（${attempt}/${CONFIG.MAX_PAGE_RETRY}）...`,
                 "warn"
               );
-              await sleep(CONFIG.RATE_LIMITED_WAIT_MS, signal);
+              await sleep(waitMs, signal);
               continue;
             }
+            if (err.code === "RISK") mRiskExhausted = true;
             onLog(`mymblog 第 ${mpage} 页拉取失败: ${err.message}，结束补扫。`, "error");
             mData = null;
             break;
           }
         }
-        if (!mData) break;
+        if (!mData) {
+          if (mRiskExhausted) {
+            stats.incomplete = true;
+            stats.resumeMpage = mpage;
+            onLog(
+              `⚠ 补扫在第 ${mpage} 页被限流中断，已保留部分预览（${stats.hits.length} 条），稍后可重跑继续`,
+              "warn"
+            );
+          }
+          break;
+        }
         const mList = mData.list || [];
         if (mList.length === 0) {
           onLog(`mymblog 空页，全量时间线已到账号最早，扫描结束。`, "info");
@@ -1682,7 +1735,8 @@
       },
       concurrency: $("#wbl-concurrency"),
       cancelQuickReposts: $("#wbl-cancel-quick-reposts"),
-      delay: $("#wbl-delay"),
+      rateSearch: $("#wbl-rate-search"),
+      rateTimeline: $("#wbl-rate-timeline"),
       previewBtn: $("#wbl-preview"),
       runBtn: $("#wbl-run"),
       stopBtn: $("#wbl-stop"),
@@ -1783,18 +1837,20 @@
         return value;
       };
       const concurrency = clampInput(els.concurrency, 1, CONFIG.CONCURRENCY, CONFIG.CONCURRENCY);
-      const rateMax = clampInput(els.delay, 1, CONFIG.RATE_MAX, CONFIG.RATE_MAX);
-      rateLimiter.setMax(rateMax);
-      return { concurrency, rateMax };
+      const rateSearch = clampInput(els.rateSearch, 1, 15, CONFIG.RATE_MAX_SEARCH);
+      const rateTimeline = clampInput(els.rateTimeline, 1, 15, CONFIG.RATE_MAX_TIMELINE);
+      searchLimiter.setMax(rateSearch);
+      timelineLimiter.setMax(rateTimeline);
+      return { concurrency, rateSearch, rateTimeline };
     }
 
     function logRuntimeCfg(runtimeCfg) {
       const pendingLiveVerification =
-        runtimeCfg.rateMax === CONFIG.RATE_MAX
-          ? "；15 次额度仅 Python 参考版实测，Tampermonkey 待验证"
+        runtimeCfg.rateSearch === CONFIG.RATE_MAX_SEARCH
+          ? "；搜索 15 次额度仅 Python 参考版实测，Tampermonkey 待验证"
           : "";
       log(
-        `运行参数：并发上限 ${runtimeCfg.concurrency} · 每 10 秒最多 ${runtimeCfg.rateMax} 次请求${pendingLiveVerification}`,
+        `运行参数：并发上限 ${runtimeCfg.concurrency} · 搜索每 10 秒最多 ${runtimeCfg.rateSearch} 次 · 时间线每 10 秒最多 ${runtimeCfg.rateTimeline} 次 · 写桶固定 ${CONFIG.RATE_MAX_WRITE}/10s${pendingLiveVerification}`,
         pendingLiveVerification ? "warn" : "info"
       );
     }
@@ -1924,6 +1980,12 @@
           });
         }
         state.lastPreview = { hits: stats.hits, filterCfg: cfg, at: Date.now() };
+        if (stats.incomplete) {
+          log(
+            `⚠ 扫描在第 ${stats.resumeMpage} 页被限流中断，已保留部分预览（${stats.hits.length} 条），稍后可重跑继续`,
+            "warn"
+          );
+        }
         const lockable = countLockable(stats.hits);
         const cancelable = countCancelable(stats.hits);
         log(
@@ -2142,7 +2204,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.8.3</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.8.4</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -2196,10 +2258,16 @@
         </div>
 
         <div class="wbl-section">
-          <span class="wbl-label">请求限速：每 10 秒最多
-            <input type="number" id="wbl-delay" value="15" min="1" max="15" step="1" style="width:50px;display:inline-block;vertical-align:middle">
-            次请求</span>
-          <div class="wbl-hint">默认 15 仅 Python 参考版实测，Tampermonkey 待验证。命中风控会暂停 30 秒；可调低额度。</div>
+          <span class="wbl-label">请求限速（每 10 秒）</span>
+          <div class="wbl-row">
+            <span>搜索</span>
+            <input type="number" id="wbl-rate-search" value="15" min="1" max="15" step="1" style="width:50px;display:inline-block;vertical-align:middle">
+            <span>次</span>
+            <span style="margin-left:8px">时间线</span>
+            <input type="number" id="wbl-rate-timeline" value="8" min="1" max="15" step="1" style="width:50px;display:inline-block;vertical-align:middle">
+            <span>次</span>
+          </div>
+          <div class="wbl-hint">搜索桶用于 searchProfile 页波次；时间线桶用于 mymblog（最近 N / mid 范围 / 补扫，深页自动加压）。写桶固定 10/10s 不暴露。搜索默认 15 仅 Python 参考版实测，Tampermonkey 待验证；mymblog 命中风控渐进退避 30s→60s→120s。</div>
         </div>
 
         <div class="wbl-section">

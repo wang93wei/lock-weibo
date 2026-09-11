@@ -50,7 +50,7 @@ if (stats.hits.length >= serverTotal) break;
 const nextEnd = oldestEpoch - 1;
 ```
 
-## Scenario: Bounded Weibo Request Concurrency (v0.8.0)
+## Scenario: Bounded Weibo Request Concurrency (v0.8.4)
 
 ### 1. Scope / Trigger
 
@@ -58,6 +58,10 @@ Apply this contract whenever changing `searchProfile` pagination, preview execut
 `modifyVisible` workers, cancellation, or request-rate controls. The goal is to overlap
 network latency without creating unbounded requests, losing cursor coverage, or returning
 the UI to idle while side effects are still running.
+
+v0.8.4 changed the throttle from one global bucket to three per-endpoint buckets
+(searchProfile / mymblog / writes) after `mymblog` deep pagination (~page 400) hit
+HTTP 414 while `searchProfile` stayed healthy under the same global 15/10s budget.
 
 ### 2. Signatures
 
@@ -71,15 +75,26 @@ lockByIds(hits, { concurrency, deletePerm, onLog, onProgress, signal })
 Runtime bounds:
 
 - `CONCURRENCY = 3`; panel input is clamped to `1..3` (`1` = serial fallback).
-- `RATE_WINDOW_MS = 10000`, `RATE_MAX = 15`; panel can lower the limit to `1..15`.
+- Three per-endpoint sliding-window buckets sharing the `createRateLimiter` factory
+  (all `RATE_WINDOW_MS = 10000`): `searchLimiter` (`RATE_MAX_SEARCH = 15`, panel-tunable
+  `wbl-rate-search` 1..15) for `searchProfile` waves; `timelineLimiter`
+  (`RATE_MAX_TIMELINE = 8`, panel-tunable `wbl-rate-timeline` 1..15) for serial `mymblog`
+  pagination plus an abortable page gap (`MYMBLOG_MIN_GAP_MS = 900`, deep pages
+  `>= MYMBLOG_DEEP_PAGE (300)` add `MYMBLOG_DEEP_EXTRA_MS = 600`); `writeLimiter`
+  (fixed `RATE_MAX_WRITE = 10`, no UI) for `modifyVisible` + `destroy`.
+- `mymblog` RISK backoff is progressive `PAGE_RISK_WAITS_MS = [30000, 60000, 120000]`
+  ±20% jitter; exhaustion keeps partial `stats` (`incomplete`, `resumeMpage`) instead of
+  discarding the preview. `searchProfile`/write RISK keep the fixed 30s pause.
 - `SEARCH_PAGES_PER_WINDOW = 30`; `mymblog` pagination remains serial.
 - `15/10s` was validated by the Python reference, not yet by Tampermonkey. Never describe
   it as browser-verified until a logged-in live run confirms it.
 
 ### 3. Contracts
 
-- Every `searchProfile`, `mymblog`, `modifyVisible`, and `destroy` request calls the same
-  `rateLimiter.acquire(signal)` immediately before `fetch()`.
+- Every `searchProfile`, `mymblog`, `modifyVisible`, and `destroy` request calls its
+  bucket's `acquire(signal)` immediately before `fetch()` (`searchLimiter`,
+  `timelineLimiter`, `writeLimiter` respectively). Page-gap sleeps are layered ON TOP
+  of the limiter acquire, never a replacement for it.
 - `searchProfile` runs fixed page waves and processes settled results in page-number order.
   Compare page 1/2 id sequences: identical non-empty sequences mean `page` is ignored;
   consume page 1 once and use page=1 for later `endtime` windows.
@@ -120,7 +135,7 @@ Runtime bounds:
 
 ### 6. Tests Required
 
-- Static: four `fetch` calls, each preceded by the global limiter; both displayed versions match.
+- Static: four `fetch` calls, each preceded by its bucket limiter; both displayed versions match.
 - Controlled Node harness: page active/ignored, concurrency 1/3, inclusive oldest-raw cursor,
   once-only worker claims, out-of-order completion, RISK/PERM/destroy, AUTH/Abort all-settled,
   mixed-result statistics, and second-run skip behavior.
@@ -169,9 +184,9 @@ payload unchanged.
 
 - Caching uid only at `createPanel` without SPA / action re-read
 - Using URL profile id when the goal is locking the logged-in user's posts
-- Fixed request delays instead of the global sliding-window `rateLimiter` (see `AGENTS.md`)
+- Fixed request delays instead of the per-bucket sliding-window limiters (see `AGENTS.md`)
 - Unbounded `Promise.all(hits.map(...))`, parallel `mymblog` pagination, or any fetch that
-  bypasses the global limiter
+  bypasses its bucket limiter
 - Advancing a concurrent search window from only the oldest *new* mid; use the oldest epoch
   from all raw returned items so boundary duplicates preserve same-second coverage
 - Throwing AUTH/Abort from a page wave or lock pool before all already-started promises settle

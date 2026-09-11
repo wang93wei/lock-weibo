@@ -396,7 +396,19 @@ X-Requested-With: XMLHttpRequest
   网络错误/5xx 可指数退避；其他 4xx 和 `ok <= 0` 是确定性业务拒绝，不盲目重试。
 - 生产侧仍需按人工清单小范围实测一次：取消一条快转并核对 Network 载荷与页面结果。
 
-## 11. 参考资料
+## 11. 分桶限流 v0.8.4 登录态验证（2026-09-12，白天）
+
+来源：用户登录态 Tampermonkey 实测（uid=<已脱敏>，时间预设“3 个月前”，并发 3，
+搜索桶 15/10s + 时间线桶 8/10s + 写桶固定 10/10s，`mymblog` 页间隙 900ms、300+ 深页 +600ms）。
+
+- `mymblog` 补扫 page 375→400+ 连续成功，已扫描 7310、失败 0，无 414/429、无 RISK 暂停；
+  同一深度在 v0.8.3 单桶 15/10s 下约 page 402 触发 HTTP 414 中断（见任务
+  `09-12-per-endpoint-throttle` prd 背景）。
+- 结论：`mymblog` 端点密度阈值显著严于 `searchProfile`；8/10s + 页间隙白天足够安全。
+  夜间阈值更开放但无公开契约，不做分时调速，维持保守默认。
+- 待补：写桶（`modifyVisible` 小批量真实锁定）与 Stop/AUTH 在途收尾仍待登录态覆盖。
+
+## 12. 参考资料
 
 - 微博客服「微博可见性变更功能相关问题」https://kefu.weibo.com/faqdetail?id=21092
 - 第三方实现（部分描述与现网不符，仅供对照）https://github.com/ByteRax/WeiBoHideTool
