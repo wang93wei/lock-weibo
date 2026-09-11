@@ -64,7 +64,7 @@ node --check scripts/weibo-batch-locker.user.js
 
 # 纯函数单测（在 node_repl 里把脚本的核心函数抽出测试，或单独 .test.js）
 # - parseWeiboDate: "Sat Jul 25 11:37:50 +0800 2026" → 2026-07-25
-# - cmpMid: <16位mid已脱敏> < <16位mid已脱敏> (超 Number.MAX_SAFE_INTEGER)
+# - cmpMid: <16位mid A> < <16位mid B> (超 Number.MAX_SAFE_INTEGER，需字符串比较)
 # - byDateRange / byMidRange / byRecentN 用样本数据验证
 # - getXsrfToken: mock document.cookie
 # - isPrivate: {visible:{type:1}} → true; {visible:{type:0}} → false

@@ -39,9 +39,9 @@
  *     0=公开 1=仅自己可见 6=好友圈(list) 9=受限 10=粉丝 3=付费会员
  *     Only "仅自己可见" (1) is used here.
  *
- *   ⚠️ Identity: idstr is canonical EVERYWHERE (dedup, filters, modifyVisible,
- *      destroy). 2010-era posts have id ≠ mid (idstr "<老帖idstr已脱敏>" vs mid
- *      "<老帖mid已脱敏>"); the mutating APIs take the idstr. Modern posts
+  *   ⚠️ Identity: idstr is canonical EVERYWHERE (dedup, filters, modifyVisible,
+  *      destroy). 2010-era posts have id ≠ mid (idstr "<10位idstr已脱敏>" vs mid
+  *      "<17位mid已脱敏>"); the mutating APIs take the idstr. Modern posts
  *      have id == idstr == mid, so only old-post behavior changes.
  */
 
@@ -270,7 +270,7 @@
   /**
    * Canonical weibo id (idstr) used for ALL operations (modifyVisible/destroy),
    * dedup and filters. ⚠️ For 2010-era posts id ≠ mid (verified 2026-08-29:
-   * idstr "<老帖idstr已脱敏>" vs mid "<老帖mid已脱敏>") and the mutating APIs take
+   * idstr "<10位idstr已脱敏>" vs mid "<17位mid已脱敏>") and the mutating APIs take
    * the idstr. Modern posts have id == idstr == mid, so only old-post behavior
    * changes.
    */

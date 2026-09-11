@@ -6,7 +6,7 @@
 
 ## Background（已复现 2026-07-29）
 
-- 首页 `https://weibo.com/`：面板提示「未识别 UID」，但 `window.$CONFIG.uid` / `$CONFIG.user.idstr` 已有值（如 `<已脱敏>`）。
+- 首页 `https://weibo.com/`：面板提示「未识别 UID」，但 `window.$CONFIG.uid` / `$CONFIG.user.idstr` 已有值（如 `<10位UID已脱敏>`）。
 - SPA 点击头像进 `/u/<uid>`：URL 已变，面板 UID 文案与启动日志仍停留在「未识别」（`refreshUidHint` 仅在创建 / 预览 / 执行时调用）。
 - 整页刷新进个人页则正常（脚本重新注入）。
 

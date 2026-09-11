@@ -74,7 +74,7 @@ async function modifyVisible(mid, signal) {
 统一签名：`(blogs: Blog[], opts) => Blog[]`，输入来自 `mymblog.data.list`。
 
 - `byDateRange(blogs, {start, end})` — `start`/`end` 为 `YYYY-MM-DD`，闭区间按天比较。内部 `parseWeiboDate(created_at)` → 比较 `YYYY-MM-DD` 字符串（避免时区坑）。
-- `byMidRange(blogs, {startMid, endMid})` — `mid` 转 BigInt 比较（mid 是 16 位数字，超出 Number.MAX_SAFE_INTEGER，**必须用 BigInt 或字符串比较**——实测 `<16位mid已脱敏>` 已超 `2^53`）。采用字符串比较（mid 定长递增，字典序等价数值序）。
+- `byMidRange(blogs, {startMid, endMid})` — `mid` 转 BigInt 比较（mid 是 16 位数字，超出 Number.MAX_SAFE_INTEGER，**必须用 BigInt 或字符串比较**——实测 `<16位mid示例>` 已超 `2^53`）。采用字符串比较（mid 定长递增，字典序等价数值序）。
 - `byRecentN(blogs, {n})` — `mymblog` 本身按时间倒序返回，取前 n 即可；但因分页，实际是「累积到 n 条命中后停止拉取」，见 3.3。
 
 > **mid 比较的坑**：mid 字符串长度一致（16 位），可直接字典序比较；若长度不等先按长度再按字典序。封装 `cmpMid(a,b)`。
