@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "终检：限流接入、分页终止、取消语义、版本双处同步、禁止模式"}
+{"file": ".trellis/spec/guides/third-party-api-verification-guide.md", "reason": "终检：未公开接口改动是否有登录态一手验证支撑"}
