@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 4
-- **Last Active**: 2026-09-01
+- **Total Sessions**: 5
+- **Last Active**: 2026-09-12
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~109 | Active |
+| `journal-1.md` | ~130 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 5 | 2026-09-12 | mymblog与searchProfile分桶限流 v0.8.4 | `13d2bb5` | `main` |
 | 4 | 2026-09-01 | 微博批量锁 v0.8.0 并发与 RUM 抑制 | `9ec441e` | `main` |
 | 3 | 2026-08-29 | modifyVisible 永久失败 PERM 不重试 + 控制台报错 | `2841165` | `main` |
 | 2 | 2026-08-29 | 修复 searchProfile total 饱和导致的扫描截断 | `615c343` | `main` |

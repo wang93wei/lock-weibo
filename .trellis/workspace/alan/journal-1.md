@@ -107,3 +107,24 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 5: mymblog与searchProfile分桶限流 v0.8.4
+
+**Date**: 2026-09-12
+**Task**: mymblog与searchProfile分桶限流 v0.8.4
+**Branch**: `main`
+
+### Summary
+
+单桶15/10s拆为search15/mymblog8+页间隙/写固定10三桶，mymblog退避渐进30s→60s→120s+断点保留，面板双输入；白天深页400+实测0限流，结论记入API notes §11
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `13d2bb5` | (see git log) |
+
+### Status
+
+[OK] **Completed**
