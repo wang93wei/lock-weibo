@@ -128,3 +128,33 @@
 ### Status
 
 [OK] **Completed**
+
+
+## Session 6: 微博面板仅本人主页显示及匹配范围收窄
+<!-- trellis-session: v=2 fp=5246c59c09f83b66 -->
+
+**Date**: 2026-09-29
+**Task**: 微博面板仅本人主页显示及匹配范围收窄
+**Branch**: `main`
+
+### Summary
+
+独立验证登录 UID 与个人页 UID，仅在本人主页显示面板；@match 收窄为 /u/*、/profile/*，版本 0.8.6。用户自行安装测试通过并授权推送。
+
+### Main Changes
+
+- 收紧面板身份门禁，保留 SPA 面板状态；同步使用说明和约束。
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `a072693b2160d3fb5233f54b81a6690e6b043736` | fix(panel): 仅在登录账号自己的主页显示面板 |
+
+### Testing
+
+- [OK] 语法、补丁、受控 Node VM 路由和 SPA 行为检查通过；独立审查通过。新版浏览器通过来自用户反馈，未执行微博写操作。
+
+### Status
+
+[OK] **Completed**
