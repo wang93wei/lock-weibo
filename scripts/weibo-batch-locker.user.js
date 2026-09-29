@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         微博批量锁脚本 (设为仅自己可见)
 // @namespace    https://github.com/wang93wei/lock-weibo
-// @version      0.8.4
+// @version      0.8.6
 // @description  在 weibo.com 登录态下按条件批量将自己的微博设为「仅自己可见」，并可选取消筛选范围内的快转。默认 dry-run 预览，二次确认后执行，可随时停止。
 // @author       AlanWang
 // @supportURL   https://github.com/wang93wei/lock-weibo/issues
-// @match        https://weibo.com/*
+// @match        https://weibo.com/u/*
+// @match        https://weibo.com/profile/*
 // @run-at       document-idle
 // @grant        none
 // @license      Apache-2.0
@@ -152,22 +153,30 @@
   // Utils
   // ===========================================================================
 
+  /** Logged-in user's uid from trusted page config; never inferred from the route. */
+  function getLoginUid() {
+    const cfg = window.$CONFIG;
+    if (!cfg) return null;
+    const candidates = [cfg.uid, cfg.user?.idstr, cfg.user?.id];
+    for (const candidate of candidates) {
+      if (candidate != null && /^[1-9]\d*$/.test(String(candidate))) {
+        return String(candidate);
+      }
+    }
+    return null;
+  }
+
+  function getProfileUid() {
+    const match = window.location.pathname.match(/^\/(?:u|profile)\/([1-9]\d*)(?:\/|$)/);
+    return match ? match[1] : null;
+  }
+
   /**
-   * Logged-in user's uid. Prefer weibo globals ($CONFIG) so homepage / SPA
-   * routes work; fall back to /u/<id> or /profile/<id> in the URL.
-   * This tool only locks own posts — always the login uid, not "page owner".
+   * Business target uid. Prefer the login config; retain the route fallback for
+   * existing action-time validation, but never use that fallback as ownership proof.
    */
   function getUid() {
-    const cfg = window.$CONFIG;
-    if (cfg) {
-      const fromCfg = cfg.uid ?? cfg.user?.idstr ?? cfg.user?.id;
-      if (fromCfg != null && /^\d+$/.test(String(fromCfg))) return String(fromCfg);
-    }
-    const m = window.location.pathname.match(/\/u\/(\d+)/);
-    if (m) return m[1];
-    const m2 = window.location.pathname.match(/\/profile\/(\d+)/);
-    if (m2) return m2[1];
-    return null;
+    return getLoginUid() ?? getProfileUid();
   }
 
   /** SPA route change: pushState / replaceState / popstate. */
@@ -2204,7 +2213,7 @@
     return `
     <div class="wbl-panel">
       <div class="wbl-header" id="wbl-header">
-        <span class="wbl-title">微博批量锁 <small>v0.8.4</small></span>
+        <span class="wbl-title">微博批量锁 <small>v0.8.6</small></span>
         <button class="wbl-min" id="wbl-min" title="收起/展开">—</button>
       </div>
       <div class="wbl-body" id="wbl-body">
@@ -2307,8 +2316,10 @@
   // Bootstrap
   // ===========================================================================
 
-  function isProfilePage() {
-    return /^\/(?:u|profile)\/\d+(?:\/|$)/.test(window.location.pathname);
+  function isOwnProfilePage() {
+    const loginUid = getLoginUid();
+    const profileUid = getProfileUid();
+    return Boolean(loginUid && profileUid === loginUid);
   }
 
   function boot() {
@@ -2318,7 +2329,7 @@
 
     const syncPanelVisibility = () => {
       const host = document.getElementById(PANEL_ID);
-      if (!isProfilePage()) {
+      if (!isOwnProfilePage()) {
         if (host) host.style.display = "none";
         return;
       }

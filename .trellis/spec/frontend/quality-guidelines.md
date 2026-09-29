@@ -20,6 +20,20 @@ Project-level invariants also live in `AGENTS.md` — keep both in sync when con
 
 **SPA UI**: Panel `#wbl-uid` must refresh on `history.pushState` / `replaceState` / `popstate` (`onSpaNavigate`), not only at panel create or preview/run click.
 
+**Own-profile gate**: Show the panel only when the numeric UID in an anchored
+`/u/<uid>` or `/profile/<uid>` route equals the independently resolved login UID
+from `$CONFIG`. Missing/invalid login identity, another user's profile, and the
+homepage must hide it. Never use the URL fallback in `getUid()` to prove ownership:
+that would make any viewed profile appear to be the logged-in account. Preserve
+the panel and its state while hidden, and restore the same instance on SPA return.
+Test both route forms, missing/invalid config, and pushState/replaceState/popstate.
+
+**Injection scope**: Keep only `https://weibo.com/u/*` and
+`https://weibo.com/profile/*` in `@match`. These patterns include other users;
+retain the login identity gate. If the initial document is a non-matching page,
+refresh after navigating to a profile to load the script. SPA visibility tracking
+applies after injection.
+
 ```js
 // Good
 const fromCfg = window.$CONFIG?.uid ?? window.$CONFIG?.user?.idstr;
@@ -199,5 +213,5 @@ payload unchanged.
 
 ## Testing Requirements
 
-- Manual: reload `.user.js` → open `weibo.com/` (must show `当前 UID: …`) → SPA navigate to `/u/<uid>` (hint stays correct, no full reload)
+- Manual: reload `.user.js` → open `weibo.com/` (panel hidden) → navigate to the logged-in user's `/u/<uid>` and refresh if the script is not yet injected (panel visible, correct UID) → another user's profile (hidden) → back (same panel restored); also cover `/profile/<uid>`.
 - No automated test suite for this package

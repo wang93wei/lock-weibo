@@ -47,7 +47,7 @@ boot → profile/SPA route gate → createPanel (Shadow DOM)
 - `runApiModeSearchProfile()` 使用含边界的 `curEnd = oldestEpoch` 和 `seenMids` 去重；不得用饱和且不可靠的 `data.total` 提前终止，也不得把游标减一。索引未覆盖 `starttime` 时必须保留 `mymblog` 补扫。
 - 三个页面级滑动窗口限流桶分管 `mymblog`（严格，页间隙+深页加压）、`searchProfile`（宽松）、`modifyVisible`/`destroy`（写桶固定）。一个 action 级 `AbortController` 贯穿限流等待、sleep、fetch、分页和 worker；已完成的服务端修改不回滚。
 - 状态只存在页面内存：IIFE 全局状态、panel 闭包状态、单次操作局部状态。刷新页面会丢失；没有 `localStorage`、IndexedDB 或 GM 存储。
-- SPA 离开个人页仅隐藏面板，不销毁快照、不自动停止操作。数字个人页路由不证明内容属于登录用户；预览也没有自动过期或账户绑定保证。
+- 面板仅在路径 UID 与独立读取的登录态 UID 一致时显示；登录身份缺失或无效时隐藏，禁止用 URL 兜底证明本人身份。SPA 离开自己的个人页仅隐藏面板，不销毁快照、不自动停止操作；预览没有自动过期或账户绑定保证。
 - Elastic APM RUM 抑制是 best-effort payload filter，不拦截业务 fetch；释放逻辑必须留在 `finally`。
 
 ## Key Directories
@@ -108,7 +108,7 @@ git diff --check
 
 ## Runtime/Tooling Preferences
 
-- 产品运行时是浏览器 userscript 环境：`@match https://weibo.com/*`、`@run-at document-idle`、`@grant none`。依赖 `window`、DOM、Fetch、Cookie 登录态和 `AbortController`，不依赖 Node 或 Python。
+- 产品运行时是浏览器 userscript 环境：`@match https://weibo.com/u/*` 和 `@match https://weibo.com/profile/*`、`@run-at document-idle`、`@grant none`。依赖 `window`、DOM、Fetch、Cookie 登录态和 `AbortController`，不依赖 Node 或 Python。
 - `node` 仅用于可选语法检查；Python 仅用于 Trellis/AI hooks。不要把两者声明为产品运行时。
 - 根目录没有产品 package manifest 或 package manager。`.opencode/package.json` 仅属于 OpenCode 助手集成，其 lockfile 和 Node engine 不约束产品。
 - `.user.js` 是直接维护、直接分发的源文件，不是可丢弃的 generated bundle。不要创建 `dist/`、source map 或并行实现。
@@ -118,7 +118,7 @@ git diff --check
 
 仓库没有常驻产品测试套件、测试框架、CI 配置或覆盖率阈值。历史归档记录过临时 Node VM harness，但未保留可直接运行的入口。`node --check` 只覆盖语法；显著行为变更需受控行为检查和真实页面验证，不能用历史结果代替本次验证。
 
-1. 重载 userscript；确认微博首页不显示面板，进入自己的 `/u/<uid>` 或 `/profile/<uid>` 后显示，UID 来自登录账号，SPA 往返时正确隐藏/恢复。
+1. 重载 userscript；确认微博首页不显示面板。首次从首页 SPA 进入时可能尚未加载脚本，需刷新个人页；直接打开自己的 `/u/<uid>` 或 `/profile/<uid>` 后显示，UID 来自登录账号，SPA 往返时正确隐藏/恢复。
 2. 对最近 N、时间预设、日期范围、mid 范围分别做 dry-run；确认不会锁定、删除或取消快转，筛选/快转开关变化会阻止旧预览执行。
 3. 两个危险选项保持关闭，用少量已知安全微博验证二次确认、预览复用、已私密项跳过、分项计数与再次执行不重复处理。
 4. 快转检查：与普通转发正确区分；仍计入最近 N；缺 `ori_mid` 跳过；显式开启后抓包核对关系 ID、先锁后取消、成功项不重发、取消失败不触发删帖兜底。关闭取消不代表整个 `destroy` 端点禁用，独立的删帖选项也使用它。
